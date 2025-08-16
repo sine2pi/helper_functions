@@ -141,25 +141,6 @@ def apply_radii(freqs, x, ctx):
     x = x[idx]
     return torch.polar(x.unsqueeze(-1), freqs)
 
-
-class smolEmbedding(nn.Module):
-    def __init__(self, dim, theta = 10000):
-        super().__init__()
-        inv_freq = theta ** -(torch.arange(0, dim, 2).float() / dim)
-        self.register_buffer('inv_freq', inv_freq)
-
-    def forward(self, seq_len, device):
-        t = torch.arange(seq_len, device = device).type_as(self.inv_freq)
-        freqs = torch.einsum('i , j -> i j', t, self.inv_freq)
-        return torch.cat((freqs, freqs), dim = -1)
-
-def srotate_half(x):
-    x1, x2 = x.chunk(2, dim = -1)
-    return torch.cat((-x2, x1), dim = -1)
-
-def sapply_rotary_pos_emb(pos, t):
-    return t * pos.cos() + srotate_half(t) * pos.sin()
-
 class axial_freqs(nn.Module):
     def __init__(self, dims, head, ctx, theta=10000, spec_shape=[]):
 
@@ -260,7 +241,6 @@ class SLSTM(nn.Module):
             y = y + x
         y = y.permute(1, 2, 0)
         return y
-
 @staticmethod
 def apply_rotary(x, freqs):
     x1 = x[..., :freqs.shape[-1]*2]
@@ -360,7 +340,6 @@ def taylor_cosine(x, order=5):
             else:
                 result += term
     return result
-
 def vectorized_taylor_sine(x, order=5):
     og_shape = x.shape
     x = x.flatten(0, -2)
@@ -389,77 +368,6 @@ def taylor_softmax(x, order=2):
         factorial_i = torch.exp(torch.lgamma(torch.tensor(i + 1, dtype=torch.float32)))
         tapprox += x**i / factorial_i
     return tapprox / torch.sum(tapprox, dim=-1, keepdim=True)
-
-
-# def second_taylor(x: torch.Tensor, remove_even_power_dups: bool = False):
-
-#     batch = x.shape[0]
-
-#     # exp(qk) = 1 + qk + (qk)^2 / 2
-#     x0 = x.new_ones((batch,)) 
-#     x1 = x
-#     x2 = einsum('... i, ... j -> ... i j', x, x) * (0.5 ** 0.5)
-
-#     if remove_even_power_dups:
-#         x2_diagonal = torch.diagonal(x2, dim1 = -2, dim2 = -1)  # Shape (batch_size, dims)
-        
-#         # Create a mask for the upper triangle (excluding the diagonal)
-#         mask = torch.ones(x2.shape[-2:], dtype = torch.bool, device=x.device).triu(1)
-        
-#         # Select upper triangle elements and apply scaling
-#         x2_upper_triangle = x2[:, mask] * (2 ** 0.5) # Using 2**0.5 for sqrt(2)
-        
-#         # Concatenate diagonal and upper triangle elements
-#         x2 = torch.cat((x2_diagonal, x2_upper_triangle), dim = -1)
-#     # else:
-#     #     # If not removing duplicates, flatten the x2 matrix
-#     #     x2 = x2.reshape(batch,)
-
-#     # Concatenate the terms along the feature dimension
-#     out = torch.cat((x0, x1, x2), dim = -1)
-#     return out
-
-# Example usage (assuming x is a Tensor)
-# x_input = torch.randn(4, 3) # Example batch size 4, feature dim 3
-# output_tensor = second_taylor_expansion_alt(x_input, remove_even_power_dups=True)
-# print(output_tensor.shape)
-
-
-def second_taylor(x: Tensor,  remove_even_power_dups = False):
-    dtype, device, dim = x.dtype, x.device, x.shape[-1]
-    x, ps = pack([x], '* d')
-    lead_dims = x.shape[0]
-    # exp(qk) = 1 + qk + (qk)^2 / 2
-    x0 = x.new_ones((lead_dims,))
-    x1 = x
-    x2 = einsum('... i, ... j -> ... i j', x, x) * (0.5 ** 0.5)
-  
-    if remove_even_power_dups:
-        x2_diagonal = torch.diagonal(x2, dim1 = -2, dim2 = -1)
-        mask = torch.ones(x2.shape[-2:], dtype = torch.bool).triu(1)
-        x2_upper_triangle = x2[:, mask] * sqrt(2)
-        x2 = torch.cat((x2_diagonal, x2_upper_triangle), dim = -1)
-    out, _ = pack((x0, x1, x2), 'b *')
-    out, = unpack(out, ps, '* d')
-    return out
-
-# def second_taylor_expansion(x: Tensor,  remove_even_power_dups = False):
-#     dtype, device, dim = x.dtype, x.device, x.shape[-1]
-#     x, ps = pack([x], '* d')
-#     lead_dims = x.shape[0]
-#     # exp(qk) = 1 + qk + (qk)^2 / 2
-#     x0 = x.new_ones((lead_dims,))
-#     x1 = x
-#     x2 = einsum('... i, ... j -> ... i j', x, x) * (0.5 ** 0.5)
-  
-#     if remove_even_power_dups:
-#         x2_diagonal = torch.diagonal(x2, dim1 = -2, dim2 = -1)
-#         mask = torch.ones(x2.shape[-2:], dtype = torch.bool).triu(1)
-#         x2_upper_triangle = x2[:, mask] * sqrt(2)
-#         x2 = torch.cat((x2_diagonal, x2_upper_triangle), dim = -1)
-#     out, _ = pack((x0, x1, x2), 'b *')
-#     out, = unpack(out, ps, '* d')
-#     return out
 
 def hz_to_midi(hz): # Converts Hz to MIDI note number. Handles 0 Hz as unvoiced.
     if hz == 0:
@@ -638,7 +546,6 @@ class KVCache(nn.Module):
 
         return k_out, v_out
 
-
 def get_activation(act: str) -> nn.Module:
 
     act_map = {
@@ -779,7 +686,6 @@ class PEncoder(nn.Module):
                 q, k, v = qkv(self.q, self.k, self.v, x=xa, xa=x, head=self.head)
                 out, _ = calculate_attention(q, k, v, mask=None, temperature=1.0, is_causal=True)
                 x = x + out
-
         return x
 
 class feature_encoder(nn.Module):
@@ -1371,7 +1277,6 @@ def pitch_tokens(audio, labels, sample_rate=16000, hop_length=160, mode="mean", 
 
 def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=False, pitch=False, harmonics=False, sample_rate=16000, hop_length=256, mode="mean", debug=False, phase_mod=False, crepe=False, aperiodics=False, dummy=False, mels=128, n_fft= 1024):
 
-
     sample_rate = batch["audio"]["sampling_rate"]
     labels = tokenizer.encode(batch["transcription"])
     audio = load_wave(batch["audio"], sample_rate)
@@ -1438,8 +1343,6 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
     # print(f"Conv1D output shape for embedded pitch: {output_embedding.shape}")
  
 
-
-
     if crepe:
         crepe_time, crepe_frequency, crepe_confidence, crepe_activation = crepe_predict(audio, sample_rate, viterbi=True)
 
@@ -1448,26 +1351,6 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
         crepe_frequency = None
         crepe_confidence = None
         crepe_activation = None
-
-
-    # # hard-coded audio hyperparameters
-    # SAMPLE_RATE = 16000
-    # N_FFT = 400
-    # HOP_LENGTH = 160
-    # CHUNK_LENGTH = 30
-    # N_SAMPLES = CHUNK_LENGTH * SAMPLE_RATE  # 480000 samples in a 30-second chunk
-    # N_FRAMES = exact_div(N_SAMPLES, HOP_LENGTH)  # 3000 frames in a mel spectrogram input
-
-
-    # N_SAMPLES_PER_TOKEN = HOP_LENGTH * 2  # the initial convolutions has stride 2
-  
-    # FRAMES_PER_SECOND = exact_div(SAMPLE_RATE, HOP_LENGTH)  # 10ms per audio frame
-    # TOKENS_PER_SECOND = exact_div(SAMPLE_RATE, N_SAMPLES_PER_TOKEN)  # 20ms per audio token
-
-
-
- 
-
 
         # spectrogram_config = {
         #     "hop_length": 256,
@@ -1592,17 +1475,8 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
         # spectrogram_tensor = (log_mel + 4.0) / 4.0
         # return spectrogram_tensor
 
-
-
-
-
-
-
-
         # transform = torchaudio.transforms.MelSpectrogram(**spectrogram_config)
         # return transform(audio).log10()
-
-
 
     if spec: 
         # if dummy:
@@ -1612,7 +1486,6 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
             # spectrogram_tensor = FEncode(spectrogram_tensor)
     else:
         spectrogram_tensor = None
-
 
     if pitch_tokens or harmonics or aperiodics:
         wavnp = audio.numpy().astype(np.float64)
@@ -1693,26 +1566,26 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
     else:
         wave_tensor = None
 
-    # if dummy:   
-    #     batch_size = 1
-    #     ctx = 1024
-    #     if spectrogram_tensor is not None:
-    #         # spectrogram_tensor = torch.randn(mels, ctx)
-    #         spectrogram_tensor = torch.ones(mels, ctx)
+    if dummy:   
+        batch_size = 1
+        ctx = 1024
+        if spectrogram_tensor is not None:
+            # spectrogram_tensor = torch.randn(mels, ctx)
+            spectrogram_tensor = torch.ones(mels, ctx)
         
-    #     if p_tensor is not None:
-    #         p_tensor = torch.ones_like(p_tensor) 
+        if p_tensor is not None:
+            p_tensor = torch.ones_like(p_tensor) 
+      
+        if pitch_tokens_tensor is not None:
+            dummy_tensor = torch.ones_like(pitch_tokens_tensor)
         
-    #     if pitch_tokens_tensor is not None:
-    #         dummy_tensor = torch.ones_like(pitch_tokens_tensor)
-        
-    #     else:
-    #         batch_size = 128
-    #         ctx = 1024
-    #         dummy_tensor = torch.ones(batch_size, ctx)
-    #         dummy_tensor = dummy_tensor.to(device)
-    # else:
-    #     dummy_tensor = None
+        else:
+            batch_size = 128
+            ctx = 1024
+            dummy_tensor = torch.ones(batch_size, ctx)
+            dummy_tensor = dummy_tensor.to(device)
+    else:
+        dummy_tensor = None
         
     if debug:
         print(f"['pitch_tokens']: {pitch_tokens_tensor.shape if pitch_tokens else None}")
@@ -1747,7 +1620,6 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
 
 def plot_waveform(waveform, sr, title="Waveform", ax=None):
     waveform = waveform.numpy()
-
     num_channels, num_frames = waveform.shape
     time_axis = torch.arange(0, num_frames) / sr
 
@@ -2057,7 +1929,7 @@ class OneShot(nn.Module):
         k = self.k(xa).view(B, K, self.head, self.hdim).transpose(1,2)
         return (q @ k.transpose(-1, -2)) * self.scale / math.sqrt(self.hdim) 
 
-# from torch import tensor
+
 # class ContextualBiasingGate2(nn.Module):
 #     def __init__(self, dims: int, head: int, memory_size: int, threshold: float = 0.8):
 #         super(ContextualBiasingGate, self).__init__()
@@ -2260,175 +2132,6 @@ class CuriosityHead(nn.Module):
         g = torch.sigmoid(g_biased_logits).view(x.size(0), -1, 1, 1) # b h 1 1 broadcast
         out = self.merge(h_main * (1 - g) + h_aux * g)
         return self.o(out)
-
-# ... (ContextualBiasingGate adapted to return an index or a preference vector) ...
-
-# class LuckyGenesWithContextualSelection(nn.Module):
-#     def __init__(self, d, h, population_size=8, mutation_rate=0.15, crossover_rate=0.3,
-#                  cb_memory_size=10, cb_threshold=0.7):
-#         super().__init__()
-#         # ... (LuckyGenes init as before) ...
-#         self.contextual_selection_gate = ContextualBiasingGateForSelection(d, population_size, cb_memory_size, cb_threshold)
-
-#     def forward(self, x, xa, mask=None):
-#         # ... (attention qkv, split, dots, etc. as before) ...
-
-#         # Contextual selection of gate strategy
-#         # The CBG returns a tensor (B, pop_size) representing preferences/logits for each population member
-#         contextual_preferences = self.contextual_selection_gate(x) # using x as context
-        
-#         # Decide which gate to use
-#         # This could be a softmax over preferences to get a weighted average of 'g's,
-#         # or a direct selection based on highest preference.
-        
-#         # Simple selection: Choose the population member indicated by the CBG's output
-#         # (Assuming CBG returns an index or a one-hot vector for the best match)
-#         # For simplicity, let's assume CBG output (B, H) and we want one 'g' (H,)
-#         # This part needs careful design for mapping B-level context to a single 'g' or
-#         # dynamically combining population members.
-        
-#         # A more robust approach might be to have CBG return a *modification* to the `fitness` vector
-#         # or a "selection pressure" vector (B, pop_size)
-        
-#         # Let's consider a simplified version where CBG outputs a 'suggested_idx' per batch item
-#         # This would require adapting CBG's output to be an index or a probability distribution.
-
-#         # Let's adapt CBG to output a (B, population_size) tensor of logits for selection
-#         cb_selection_logits = self.contextual_biasing_gate_output_selector(x) # (B, pop_size)
-        
-#         # Combine CBG selection logits with global fitness
-#         # This allows the GA's fitness to interact with contextual preference
-#         # We need a 'g' for each batch item, so we can't just pick one `best_idx`.
-        
-#         # Option A: Dynamically blend population members based on context
-#         selection_weights = F.softmax(cb_selection_logits, dim=-1) # (B, pop_size)
-        
-#         # Get all population gates, unsqueeze for batch dimension: (1, pop_size, H)
-#         all_gates = torch.stack(list(self.population), dim=0).unsqueeze(0) 
-        
-#         # Compute a weighted average of gates for each batch item: (B, H)
-#         g_for_batch = (selection_weights.unsqueeze(-1) * all_gates).sum(dim=1) # (B, H)
-
-#         # Apply genetic gate
-#         g = torch.sigmoid(g_for_batch).view(x.size(0), -1, 1, 1) # b h 1 1 broadcast
-#         out = self.merge(h_main * (1 - g) + h_aux * g)
-        
-#         # ... (fitness update and evolution logic as before) ...
-#         # Fitness update would need to consider which members contributed to 'g_for_batch'
-#         # This makes the fitness update more complex (e.g., fractional fitness contribution)
-
-#         return self.o(out)
-
-# ... (ContextualBiasingGate adapted to return a scalar fitness boost for the chosen gate) ...
-
-# class LuckyGenesWithContextualFitness(nn.Module):
-#     def __init__(self, d, h, population_size=8, mutation_rate=0.15, crossover_rate=0.3,
-#                  cb_memory_size=10, cb_threshold=0.7):
-#         super().__init__()
-#         # ... (LuckyGenes init as before) ...
-#         self.contextual_fitness_booster = ContextualBiasingGateForFitness(d, cb_memory_size, cb_threshold)
-
-#     def forward(self, x, xa, mask=None):
-#         # Pick best gate from cur population (initial GA choice)
-#         best_idx = torch.argmax(self.fitness)
-#         g = torch.sigmoid(self.population[best_idx])
-        
-#         # ... (Normal attention computation) ...
-
-#         # Apply genetic gate
-#         g = g.view(1, -1, 1, 1)
-#         out = self.merge(h_main * (1 - g) + h_aux * g)
-        
-#         # Update fitness of cur best based on usage
-#         if self.training:
-#             self.fitness[best_idx] += 1.0  # Simple fitness: usage count
-
-#             # Get contextual fitness boost/penalty
-#             # Assuming CBG returns a (B,) tensor of boosts. We average or sum.
-#             contextual_boosts = self.contextual_fitness_booster(x) # using x as context
-#             # Let's say CBG returns a (B,) tensor, we'll sum them for the cur best_idx
-#             self.fitness[best_idx] += contextual_boosts.sum().item() # Or mean, or another aggregation
-
-#             # Evolve every N steps
-#             if self.generation % 100 == 0:
-#                 self.evolve_population()
-            
-#         return self.o(out)
-
-# ... (ContextualBiasingGate adapted to return mutation/crossover rate modifications) ...
-
-# class LuckyGenesWithContextualGA(nn.Module):
-#     def __init__(self, d, h, population_size=8, mutation_rate=0.15, crossover_rate=0.3,
-#                  cb_memory_size=10, cb_threshold=0.7):
-#         super().__init__()
-#         # ... (LuckyGenes init as before) ...
-#         self.contextual_ga_modulator = ContextualBiasingGateForGARates(d, cb_memory_size, cb_threshold)
-
-#     def evolve_population(self, cur_context_mod_rates): # Pass context-dependent rates
-#         # ... (tournament selection) ...
-#         # Use cur_context_mod_rates for self.mut_rate and self.cross_rate
-#         # Example:
-#         # child = self.crossover(parent1, parent2, cur_cross_rate) # Pass rate
-#         # if torch.rand(1) < cur_mut_rate: # Use rate
-#         # ...
-#         pass # Requires more significant modification to crossover/evolve_population
-
-#     def forward(self, x, xa, mask=None):
-#         # ... (forward pass logic) ...
-        
-#         if self.training:
-#             # ... (fitness update) ...
-
-#             # Get contextual modulation for GA rates
-#             mod_rates = self.contextual_ga_modulator(x) # (B, 2) for mut_rate, cross_rate
-#             # Take average across batch or use a specific element's context
-#             cur_mut_rate = (self.mut_rate + mod_rates[:, 0].mean()).clamp(0.01, 0.5) # Example clamping
-#             cur_cross_rate = (self.cross_rate + mod_rates[:, 1].mean()).clamp(0.1, 0.9)
-
-#             # Evolve every N steps
-#             if self.generation % 100 == 0:
-#                 self.evolve_population(cur_mut_rate, cur_cross_rate) # Pass rates
-                
-#         return self.o(out)
-
-# # Example usage
-# d_model = 128
-# head = 8
-# memory_size = 10
-# cb_threshold = 0.75
-
-# curiosity_head = CuriosityHead(d_model, head, memory_size=memory_size, cb_threshold=cb_threshold)
-
-# # Create dummy input tensors
-# batch_size = 2
-# seq_len_x = 20
-# seq_len_xa = 30
-# x_input = torch.randn(batch_size, seq_len_x, d_model)
-# xa_input = torch.randn(batch_size, seq_len_xa, d_model)
-
-# # Forward pass
-# output = curiosity_head(x_input, xa_input)
-
-# print(f"Output shape of CuriosityHead with contextual bias: {output.shape}")
-
-# # Example usage
-# input_dim = 128
-# head = 4
-# q_len = 10 # Query sequence length
-# k_len = 20 # Key/Value sequence length
-# memory_size = 5
-# threshold = 0.7
-
-# attention_module = MainAttentionWithContextualBias(input_dim, head, q_len, k_len, memory_size, threshold)
-
-# # Create dummy input tensors
-# query_input = torch.randn(1, q_len, input_dim)
-# xa_input = torch.randn(1, k_len, input_dim)
-
-# # Forward pass
-# output = attention_module(query_input, xa_input)
-
-# print(f"Output shape of attention with contextual bias: {output.shape}")
 
 def get_encoder(mels = None, input_dims = None, dims = None, head=None, act="relu", downsample = True, target_length = False, attend_pitch=False, feature = "spectrogram") -> nn.Module:
 
@@ -2675,7 +2378,6 @@ class MyModel(nn.Module):
 
         if self.num_layers > 5:
             cur_dict = self.layers[5]
-
             x = cur_dict['res3'](a + b + c) 
             
             x = cur_dict['res3'](x, xa, None)
@@ -2730,8 +2432,6 @@ class MyModel(nn.Module):
         #     x = res['res3'](x, xa, None)
         #     x = res['lna'](x)
 
-
-
 class attention_a(nn.Module):
     def __init__(self, dims: int, head: int, layer):
         super().__init__()
@@ -2753,7 +2453,6 @@ class attention_a(nn.Module):
         wv = a.permute(0, 2, 1, 3).flatten(start_dim=2)
         out = self.out(wv)
         return out
-
 
 class attentio0(nn.Module):
     def __init__(self, dims: int, head: int, layer):
@@ -2804,7 +2503,6 @@ class attentio0(nn.Module):
         wv = rearrange(wv, 'b h c d -> b c (h d)')
         out = self.out(wv)
         return out
-
 
 class attentio0b(nn.Module):
     def __init__(self, dims: int, head: int, layer):
