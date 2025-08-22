@@ -1,41 +1,651 @@
 
-# helper functions classes & modules 
 
+``` python
 import torch
 import os
 import pyworld as pw
+from einops import rearrange, pack, unpack, repeat
 import numpy as np
 import torchaudio
 import torch.nn.functional as F
-from datasets import load_dataset
-from datasets import Audio
+from datasets import load_dataset, Audio
 from dataclasses import dataclass
-
+from typing import Any, List, Dict, Optional, Union, Tuple
 import math
+from math import sqrt
 import matplotlib.pyplot as plt
-import torch.nn as nn
+from torch import nn, einsum
 import torch.nn.init as init
 from torch import Tensor
-from typing import Any, List, Dict, Optional, Union, Tuple
 from torch.nn.functional import scaled_dot_product_attention
+from functools import lru_cache
+from subprocess import CalledProcessError, run
+from math import gcd
+from collections import namedtuple
+from functools import partial, reduce
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 
-def shape(self, tensor: torch.Tensor, ctx: int, batch: int):
-    return tensor.view(batch, ctx, self.head, self.head_dim).transpose(1, 2).contiguous()
+def causal_mask(i, j, device):
+    return torch.ones((i, j), device = device, dtype = torch.bool).triu(j - i + 1)
 
-def reshape_to_output(self, attn_output, batch, ctx):
-    return attn_output.permute(0, 2, 1, 3).reshape(batch, ctx, self.dims).contiguous()
-  
-def cos_sim(q: Tensor, k: Tensor, v: Tensor, mask) -> Tensor:
-    q_norm = torch.nn.functional.normalize(q, dim=-1, eps=1e-12)
-    k_norm = torch.nn.functional.normalize(k, dim=-1, eps=1e-12)
-    qk_cosine = torch.matmul(q_norm, k_norm.transpose(-1, -2))
-    qk_cosine = qk_cosine + mask
-    weights = F.softmax(qk_cosine, dim=-1)
-    out = torch.matmul(weights, v)
+def log(t, eps = 1e-20):
+    return torch.log(t + eps)
+
+def l2norm(t):
+    return F.normalize(t, dim = -1)
+
+def gumbel_noise(t):
+    noise = torch.zeros_like(t).uniform_(0, 1)
+    return -log(-log(noise))
+
+def gumbel_sample(t, temperature = 1., dim = -1):
+    return ((t / temperature) + gumbel_noise(t)).argmax(dim = dim)
+
+def valid(default_value, *items):
+    for item in items:
+        if item is not None:
+            return item
+    return default_value
+
+def dict_to(d, device, dtype=dtype):
+    return {k: v.to(device, dtype) if isinstance(v, torch.Tensor) else v 
+            for k, v in d.items()}  
+
+def have(a):
+    return a is not None
+    
+def Sequential(*modules):
+    return nn.Sequential(*filter(have, modules))    
+
+def AorB(a, b):
+    return a if have(a) else b
+
+def shift(t, amount, mask = None):
+    if amount == 0:
+        return t
+
+    if have(mask):
+        t = t.masked_fill(~mask[..., None], 0.)
+    return F.pad(t, (0, 0, amount, -amount), value = 0.)
+
+def always(value):
+    return lambda *args, **kwargs: value
+
+def cast_tuple(val):
+    return (val,) if not isinstance(val, tuple) else val
+        
+def safe_div(n, d, eps = 1e-6):
+    return n.div_(d + eps)
+
+def lcm(*numbers):
+    return int(reduce(lambda x, y: int((x * y) / gcd(x, y)), numbers, 1))
+
+class LayerNorma(nn.Module):
+    def __init__(self, emb_dim):
+        super().__init__()
+        self.eps = 1e-5
+        self.scale = nn.Parameter(torch.ones(emb_dim))
+        self.shift = nn.Parameter(torch.zeros(emb_dim))
+
+    def forward(self, x):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        norm_x = (x - mean) / torch.sqrt(var + self.eps)
+        return self.scale * norm_x + self.shift
+
+class LayerNormb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.register_buffer("beta", torch.zeros(dim))
+
+    def forward(self, x):
+        return F.layer_norm(x, x.shape[-1:], self.gamma, self.beta)
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.scale = dim ** 0.5
+        self.gamma = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return self.gamma * F.normalize(x, dim = -1) * self.scale
+
+def get_device():
+    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+def get_dtype():
+    return torch.float32 if torch.cuda.is_available() else torch.float64
+
+def tox():
+    return {"device": get_device(), "dtype": get_dtype()}
+
+def cos_xy(x: Tensor, y: Tensor) -> Tensor:
+    out = F.softmax(torch.matmul(F.normalize(x, dim=-1), F.normalize(y, dim=-1).transpose(0, 1)) / math.sqrt(x.shape[-1]), dim=-1)
     return out
+
+def cos_qkv(q: Tensor, k: Tensor, v: Tensor, mask=None) -> Tensor:
+    out = torch.matmul(F.softmax(torch.matmul(torch.nn.functional.normalize(q, dim=-1), torch.nn.functional.normalize(k, dim=-1).transpose(-1, -2)) + (mask if mask is not None else 0), dim=-1), v)
+    return out
+
+def cos_qkv_scaled(q: Tensor, k: Tensor, v: Tensor, mask=None) -> Tensor:
+    dk = q.size(-1)
+    attn_scores = torch.matmul(F.normalize(q, dim=-1), F.normalize(k, dim=-1).transpose(-1, -2))
+    scaled_attn_scores = attn_scores / math.sqrt(dk)
+    if mask is not None:
+        scaled_attn_scores = scaled_attn_scores + mask 
+    attention_weights = F.softmax(scaled_attn_scores, dim=-1)
+    out = torch.matmul(attention_weights, v)
+    return out
+
+class RelativePositionBias(nn.Module):
+    def __init__(self, dims, head, layer = 3):
+        super().__init__()
+        self.net = nn.ModuleList([])
+        self.net.append(nn.Sequential(nn.Linear(1, dims), nn.SiLU()))
+
+        for _ in range(layer - 1):
+            self.net.append(nn.Sequential(nn.Linear(dims, dims), nn.SiLU()))
+        self.net.append(nn.Linear(dims, head))
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def forward(self, i, j):
+        assert j >= i
+        device = self.device
+
+        i_pos = torch.arange(i, device = device) + (j - i)
+        j_pos = torch.arange(j, device = device)
+        rel_pos = (rearrange(i_pos, 'i -> i 1') - rearrange(j_pos, 'j -> 1 j'))
+        rel_pos += (j - 1)
+        x = torch.arange(-j + 1, j, device = device).float()
+        x = rearrange(x, '... -> ... 1')
+
+        for layer in self.net:
+            x = layer(x)
+        x = x[rel_pos]
+        return rearrange(x, 'i j h -> h i j')
+
+def sinusoids(ctx, dims, theta=10000):
+    tscales = torch.exp(-torch.log(torch.tensor(float(theta))) / (dims // 2 - 1) * torch.arange(dims // 2, device=device, dtype=torch.float32))
+    scaled = torch.arange(ctx, device=device, dtype=torch.float32).unsqueeze(1) * tscales.unsqueeze(0)
+    positional_embedding = nn.Parameter(torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=1) , requires_grad=True)
+    return positional_embedding
+
+class AbsolutePositions(nn.Module):
+    def __init__(self, ctx, dims):
+        super().__init__()
+        self.emb = nn.Embedding(ctx, dims)
+    def forward(self, x):
+        return self.emb(torch.arange(x.shape[1], device=device))[None, :, :]
+
+class FixedPositions(nn.Module):
+    def __init__(self, dims, head, ctx, theta=10000):
+        super().__init__()
+
+        freq = (theta / 220.0) * 700 * (
+            torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), 
+                    (dims // head) // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+
+        position = torch.arange(0, ctx, device=device, dtype=dtype)
+        sinusoid_inp = torch.einsum("i,j->ij", position, freq)
+        emb = torch.cat((sinusoid_inp.sin(), sinusoid_inp.cos()), dim=-1)
+        self.register_buffer('emb', emb)
+
+    def forward(self, x):
+        return self.emb[None, :x.shape[1], :].to(x)
+
+class PositionalR(nn.Module):
+    def __init__(self, dims: int, ctx: int):
+        super().__init__()
+        self.dims = dims
+        self.ctx = ctx
+        self.pe = self.get_positional_encoding(ctx)
+
+    def get_positional_encoding(self, ctx):
+        pe = torch.zeros(ctx, self.dims)
+        position = torch.arange(0, ctx, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.dims, 2, dtype=torch.float32) * (-math.log(10000.0) / self.dims))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        return pe.to(device)
+
+    def forward(self, x):
+        ctx = x.size(1)
+        pe = self.pe[:, :ctx, :]
+        x = x * math.sqrt(self.dims)
+        x = x + pe
+        return x
+
+def pitch_bias(f0):
+    f0_flat = f0.squeeze().float()
+    f0_norm = (f0_flat - f0_flat.mean()) / (f0_flat.std() + 1e-8)
+    f0_sim = torch.exp(-torch.cdist(f0_norm.unsqueeze(1), 
+                                f0_norm.unsqueeze(1)))
+    return f0_sim.unsqueeze(0).unsqueeze(0)
+
+def theta_freqs(dims, head, theta):
+    if theta.dim() == 0:
+        theta = theta.unsqueeze(0)
+    freq = (theta / 220.0) * 700 * (
+        torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), 
+                (dims // head) // 2, device=theta.device, dtype=theta.dtype) / 2595) - 1) / 1000
+    return freq
+
+def apply_radii(freqs, x, ctx):
+    F = x.shape[0] / ctx
+    idx = torch.arange(ctx, device=device)
+    idx = (idx * F).long().clamp(0, x.shape[0] - 1)
+    x = x[idx]
+    return torch.polar(x.unsqueeze(-1), freqs)
+
+class frequencies(nn.Module):
+    def __init__(self, dims, head, theta = 10000):
+        super().__init__()
+        dim = dims // head
+        inv_freq = theta ** -(torch.arange(0, dim, 2).float() / dim)
+        self.register_buffer('inv_freq', inv_freq)
+
+    def forward(self, x):
+        if isinstance(x, int):
+            ctx = x 
+        elif isinstance(x, torch.Tensor):    
+            if x.dim()   == 1:
+                ctx = x.shape            
+            elif x.dim() == 2:
+                batch, ctx = x.shape
+            elif x.dim() == 3:
+                batch, ctx, dims = x.shape
+            else:
+                batch, head, ctx, dims = x.shape
+        t = torch.arange(ctx, device=device).type_as(self.inv_freq)
+        freqs = torch.einsum('i , j -> i j', t, self.inv_freq)
+        return torch.cat((freqs, freqs), dim = -1)
+
+def rrotate_half(x):
+    x1, x2 = x.chunk(2, dim = -1)
+    return torch.cat((-x2, x1), dim = -1)
+
+def sapply_rotary_pos_emb(pos, t):
+    return t * pos.cos() + rrotate_half(t) * pos.sin()
+
+class axial_freqs(nn.Module):
+    def __init__(self, dims, head, ctx, theta=10000, spec_shape=[]):
+
+        time_frames, freq_bins = spec_shape
+        time_frames = time_frames
+        freq_bins = freq_bins
+        
+        time_theta = 50.0
+        time_freqs = 1.0 / (time_theta ** (torch.arange(0, dims, 4)[:(dims // 4)].float() / dims))
+        self.register_buffer('time_freqs', time_freqs)
+        
+        freq_theta = 100.0
+        freq_freqs = 1.0 / (freq_theta ** (torch.arange(0, dims, 4)[:(dims // 4)].float() / dims))
+        self.register_buffer('freq_freqs', freq_freqs)
+
+        t = torch.arange(ctx, device=device, dtype=dtype)
+        t_x = (t % time_frames).float()
+        t_y = torch.div(t, time_frames, rounding_mode='floor').float()
+        freqs_x = torch.outer(t_x, time_freqs)
+        freqs_y = torch.outer(t_y, freq_freqs)
+        freqs_cis_x = torch.polar(torch.ones_like(freqs_x), freqs_x)
+        freqs_cis_y = torch.polar(torch.ones_like(freqs_y), freqs_y)
+        return torch.cat([freqs_cis_x, freqs_cis_y], dim=-1)
+
+def compute_freqs_base(dim):
+    mel_scale = torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 4000/200)), dim // 2, device=device, dtype=dtype) / 2595) - 1
+    return 200 * mel_scale / 1000 
+
+class GELU(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        return 0.5 * x * (1 + torch.tanh(torch.sqrt(torch.tensor(2.0 / torch.pi)) * (x + 0.044715 * torch.pow(x, 3))))
+
+def mel_scale_scalar(freq: float) -> float:
+    return 1127.0 * math.log(1.0 + freq / 700.0)
+
+def mel_scale(freq: Tensor) -> Tensor:
+    return 1127.0 * (1.0 + freq / 700.0).log()
+
+def trace_x(func):
+    def wrapper(*args, **kwargs):
+        print(f"Calling {func.__name__}")
+        result = func(*args, **kwargs)
+        if isinstance(result, torch.Tensor):
+            print(f"  {func.__name__} returned shape: {result.shape}")
+        return result
+    return wrapper
+
+def track_x(new_x, operation=""):
+    x_id = [id(new_x)]
+    if new_x is None:
+        return new_x
+    cur_id = id(new_x)
+    if cur_id != x_id[0]:
+        print(f"x FLOW: {x_id[0]} → {cur_id} in {operation}")
+        x_id[0] = cur_id
+    else:
+        print(f"x REUSE: {cur_id} in {operation}")
+    return new_x
+
+def track_xa(new_xa, operation=""):
+    xa_id = [id(new_xa)] if new_xa is not None else [None]
+    if new_xa is None:
+        return new_xa
+    cur_id = id(new_xa)
+    if cur_id != xa_id[0]:
+        print(f"xa FLOW: {xa_id[0]} → {cur_id} in {operation}")
+        xa_id[0] = cur_id
+    else:
+        print(f"xa REUSE: {cur_id} in {operation}")
+    return new_xa
+
+def rotate_every_two(x):
+    x = rearrange(x, '... (d j) -> ... d j', j = 2)
+    x1, x2 = x.unbind(dim = -1)
+    x = torch.stack((-x2, x1), dim = -1)
+    return rearrange(x, '... d j -> ... (d j)')
+
+def apply_rotory_pos_emb(q, k, sinu_pos):
+    sinu_pos = rearrange(sinu_pos, '() n (j d) -> n j d', j = 2)
+    sin, cos = sinu_pos.unbind(dim = -2)
+    sin, cos = map(lambda t: repeat(t, 'b n -> b (n j)', j = 2), (sin, cos))
+    q, k = map(lambda t: (t * cos) + (rotate_every_two(t) * sin), (q, k))
+    return q, k
+
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+def rotate_emb(x):
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+def apply_emb(q, k, cos, sin, ctx=None, unsqueeze_dim=1):
+    cos = cos[0].unsqueeze(unsqueeze_dim)
+    sin = sin[0].unsqueeze(unsqueeze_dim)
+    cos = cos[..., : cos.shape[-1] // 2].repeat_interleave(2, dim=-1)
+    sin = sin[..., : sin.shape[-1] // 2].repeat_interleave(2, dim=-1)
+    rotary_dim = cos.shape[-1]
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+    q_embed = (q_rot * cos) + (rotate_emb(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_emb(k_rot) * sin)
+    q_embed = torch.cat([q_embed, q_pass], dim=-1)
+    k_embed = torch.cat([k_embed, k_pass], dim=-1)
+    return q_embed, k_embed
+
+class RotaryEmb(nn.Module):
+    def __init__(n, dims, head):
+        super().__init__()
+        n.hd=dims // head
+ 
+        n.scaling = 1.0
+        n.theta = nn.Parameter((torch.tensor(360000, device=device, dtype=dtype)), requires_grad=False)  
+        n.register_buffer('freqs_base', n._compute_freqs_base(), persistent=False)
+        n.freqs = 1.0 / (n.theta ** (torch.arange(0, dims // head, 2, device=device, dtype=dtype)[:(dims // head // 2)].float() / dims // head))
+
+    def _compute_freqs_base(n):
+        mel_scale = torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 4000/200)), n.hd // 2, device=device, dtype=dtype) / 2595) - 1
+        return 200 * mel_scale / 1000 
+
+    def forward(n, x, ctx):
+        freqs = n.freqs[None, :, None].float().expand(ctx.shape[0], -1, 1).to(x.device)
+        position = ctx[:, None, :].float()
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cuda"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (freqs.float() @ position.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * n.scaling
+            sin = emb.sin() * n.scaling
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+class positions(nn.Module): 
+    def __init__(n, dims, head):
+        super().__init__()
+
+        n.audio = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)        
+        n.text = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)  
+        n.rotary = RotaryEmb(dims, head)
+
+    def forward(n, x: Tensor, xa = None, kv_cache=None, fa=36000.0, fb=36000.0, freqs=False):
+        x = x + n.text(x.shape[1], x.shape[-1], fa).to(device, dtype)   
+        xa = xa + n.audio(xa.shape[1], xa.shape[-1], fb).to(device, dtype)    
+        if freqs:
+            ctx = torch.arange(0, x.shape[1], device=x.device).unsqueeze(0)
+            xf  = n.rotary(x, ctx)      
+            ctx = torch.arange(0, xa.shape[1], device=xa.device).unsqueeze(0)
+            xaf = n.rotary(xa, ctx)
+            return xf, xaf
+        else:
+            return x, xa
+
+class SLSTM(nn.Module):
+    def __init__(self, dimension: int, num_layers: int = 2, skip: bool = False, bias = True, batch_first = True):
+        super().__init__()
+        self.skip = skip
+        self.lstm = nn.LSTM(dimension, dimension, num_layers, bias, batch_first)
+
+    def forward(self, x):
+        x = x.permute(2, 0, 1)
+        y, _ = self.lstm(x)
+        if self.skip:
+            y = y + x
+        y = y.permute(1, 2, 0)
+        return y
+
+@staticmethod
+def apply_rotary(x, freqs):
+    x1 = x[..., :freqs.shape[-1]*2]
+    x2 = x[..., freqs.shape[-1]*2:]
+    orig_shape = x1.shape
+    if x1.ndim == 2:
+        x1 = x1.unsqueeze(0)
+    x1 = x1.float().reshape(*x1.shape[:-1], -1, 2).contiguous()
+    x1 = torch.view_as_complex(x1) * freqs
+    x1 = torch.view_as_real(x1).flatten(-2)
+    x1 = x1.view(orig_shape)
+    return torch.cat([x1.type_as(x), x2], dim=-1)
+
+def scaled_relu(x, sequence_length):
+    relu_output = torch.relu(x)
+    return relu_output / sequence_length
+
+def taylor_softmax(x, order=2):
+    tapprox = 1.0
+    for i in range(1, order + 1):
+        factorial_i = torch.exp(torch.lgamma(torch.tensor(i + 1, dtype=torch.float32)))
+        tapprox += x**i / factorial_i
+    return tapprox / torch.sum(tapprox, dim=-1, keepdim=True)
+
+def taylor_masked(x, mask, order=2):
+    tapprox = torch.zeros_like(x)
+    unmasked = x.masked_select(mask) 
+    approx_values = 1.0 + unmasked
+    for i in range(1, order + 1):
+        factorial_i = torch.exp(torch.lgamma(torch.tensor(i + 1, dtype=torch.float32)))
+        approx_values += unmasked**i / factorial_i
+    tapprox.masked_scatter_(mask, approx_values)
+    sum_approx = torch.sum(tapprox, dim=-1, keepdim=True)
+    toutput = tapprox / (sum_approx + 1e-9) 
+    toutput = toutput * mask 
+    return toutput
+
+def taylor_softmax2(x, mask=None, order=2):
+    if mask is None:
+        tapprox = 1.0 + x
+        for i in range(1, order + 1):
+            factorial_i = torch.exp(torch.lgamma(torch.tensor(i + 1, dtype=torch.float32)))
+            tapprox += x**i / factorial_i
+        return tapprox / torch.sum(tapprox, dim=-1, keepdim=True)
+
+    else:
+        tapprox = torch.zeros_like(x)
+        unmasked = x.masked_select(mask)
+        tapprox = 1.0 + unmasked
+        for i in range(1, order + 1):
+            factorial_i = torch.exp(torch.lgamma(torch.tensor(i + 1, dtype=torch.float32)))
+            tapprox += unmasked**i / factorial_i
+
+        tapprox_full = torch.zeros_like(x)
+        tapprox_full.masked_scatter_(mask, tapprox)
+
+        sum_approx = torch.sum(tapprox_full, dim=-1, keepdim=True)
+        toutput = tapprox_full / (sum_approx + 1e-9)
+
+        toutput = toutput * mask.float()
+        return toutput
+
+def taylor_softmax_2nd_order(x):
+    exp_approx = 1 + x + (x**2) / 2
+    return exp_approx / torch.sum(exp_approx, dim=-1, keepdim=True)
+
+def taylor_softmax_approximation(x, order=2):
+    if order == 0:
+        return torch.ones_like(x) / x.size(-1) 
+    elif order == 1:
+        numerator = 1 + x
+    elif order == 2:
+        numerator = 1 + x + 0.5 * x**2
+    else:
+        raise NotImplementedError("Higher orders are not implemented yet.")
+    denominator = torch.sum(numerator, dim=-1, keepdim=True)
+    return numerator / denominator
+
+def taylor_sine(x, order=5):
+    result = torch.zeros_like(x)
+    for i in range(order + 1):
+        if i % 2 == 1:  
+            term = x**i / torch.exp(torch.lgamma(torch.tensor(i + 1, dtype=torch.float32)))
+            if (i // 2) % 2 == 1: 
+                result -= term
+            else:
+                result += term
+    return result
+
+def taylor_cosine(x, order=5):
+    result = torch.zeros_like(x)
+    for i in range(order + 1):
+        if i % 2 == 0:  
+            term = x**i / torch.exp(torch.lgamma(torch.tensor(i + 1, dtype=torch.float32)))
+            if (i // 2) % 2 == 1: 
+                result -= term
+            else:
+                result += term
+    return result
+
+def vectorized_taylor_sine(x, order=5):
+    og_shape = x.shape
+    x = x.flatten(0, -2)
+    exponents = torch.arange(1, order + 1, 2, device=x.device, dtype=torch.float32)
+    x_powers = x.unsqueeze(-1) ** exponents
+    factorials = torch.exp(torch.lgamma(exponents + 1))
+    signs = (-1)**(torch.arange(0, len(exponents), device=x.device, dtype=torch.float32))
+    terms = signs * x_powers / factorials
+    result = terms.sum(dim=-1)
+    return result.view(og_shape)
+
+def vectorized_taylor_cosine(x, order=5):
+    og_shape = x.shape
+    x = x.flatten(0, -2)
+    exponents = torch.arange(0, order + 1, 2, device=x.device, dtype=torch.float32)
+    x_powers = x.unsqueeze(-1) ** exponents
+    factorials = torch.exp(torch.lgamma(exponents + 1))
+    signs = (-1)**(torch.arange(0, len(exponents), device=x.device, dtype=torch.float32))
+    terms = signs * x_powers / factorials
+    result = terms.sum(dim=-1)
+    return result.view(og_shape)
+
+def taylor_softmax(x, order=2):
+    tapprox = 1.0
+    for i in range(1, order + 1):
+        factorial_i = torch.exp(torch.lgamma(torch.tensor(i + 1, dtype=torch.float32)))
+        tapprox += x**i / factorial_i
+    return tapprox / torch.sum(tapprox, dim=-1, keepdim=True)
+
+def second_taylor(x: Tensor,  remove_even_power_dups = False):
+    dtype, device, dim = x.dtype, x.device, x.shape[-1]
+    x, ps = pack([x], '* d')
+    lead_dims = x.shape[0]
+    x0 = x.new_ones((lead_dims,))
+    x1 = x
+    x2 = einsum('... i, ... j -> ... i j', x, x) * (0.5 ** 0.5)
+  
+    if remove_even_power_dups:
+        x2_diagonal = torch.diagonal(x2, dim1 = -2, dim2 = -1)
+        mask = torch.ones(x2.shape[-2:], dtype = torch.bool).triu(1)
+        x2_upper_triangle = x2[:, mask] * sqrt(2)
+        x2 = torch.cat((x2_diagonal, x2_upper_triangle), dim = -1)
+    out, _ = pack((x0, x1, x2), 'b *')
+    out, = unpack(out, ps, '* d')
+    return out
+
+def hz_to_midi(hz):
+    if hz == 0:
+        return 0
+    return 12 * np.log2(hz / 440) + 69
+
+def midi_to_pitch_class(midi_note):
+    if midi_note == 0:
+        return -1
+    return int(round(midi_note)) % 12
+
+def pcp(pitch_hz, num_pitch_classes=12):
+    pcp = torch.zeros(len(pitch_hz), num_pitch_classes)
+    for i, hz in enumerate(pitch_hz):
+        midi_note = hz_to_midi(hz)
+        pitch_class = midi_to_pitch_class(midi_note)
+        if pitch_class != -1:
+            pcp[i, pitch_class] = 1
+    return pcp
+
+def one_hot_pitch(pitch_hz, min_hz=50, max_hz=1000, num_bins=200):
+    pitch_bins = np.linspace(min_hz, max_hz, num_bins + 1)
+    one_hot = torch.zeros(len(pitch_hz), num_bins)
+    for i, hz in enumerate(pitch_hz):
+        if hz > 0:
+            bin_idx = np.digitize(hz, pitch_bins) - 1
+            if 0 <= bin_idx < num_bins:
+                one_hot[i, bin_idx] = 1
+    return one_hot
+
+def gaussian_pitch(pitch_hz, min_hz=50, max_hz=1000, num_bins=200, sigma=1.0):
+    pitch_bins_hz = np.linspace(min_hz, max_hz, num_bins)
+    gaussian = torch.zeros(len(pitch_hz), num_bins)
+
+    for i, hz in enumerate(pitch_hz):
+        if hz > 0:
+            midi_note = hz_to_midi(hz)
+            midi_min = hz_to_midi(min_hz)
+            midi_max = hz_to_midi(max_hz)
+            bin_idx_float = (midi_note - midi_min) / (midi_max - midi_min) * (num_bins - 1)
+
+            for bin_j in range(num_bins):
+                bin_center_midi = midi_min + (bin_j / (num_bins - 1)) * (midi_max - midi_min)
+                gaussian[i, bin_j] = torch.exp(-torch.tensor((midi_note - bin_center_midi)**2 / (2 * sigma**2)))
+            gaussian[i] /= gaussian[i].sum()
+            
+    return gaussian
+
+def crepe_predict(audio, sample_rate, viterbi=False):
+    import torchcrepe
+    audio = audio.numpy().astype(np.float32)
+    time, frequency, confidence, activation = torchcrepe.predict(
+        audio, sample_rate=sample_rate, viterbi=viterbi)
+    crepe_time = torch.from_numpy(time)
+    crepe_frequency = torch.from_numpy(frequency)
+    crepe_confidence = torch.from_numpy(confidence)
+    crepe_activation = torch.from_numpy(activation)
+    return crepe_time, crepe_frequency, crepe_confidence, crepe_activation
 
 def rbf_scores(q, k, rbf_sigma=1.0, rbf_ratio=0.0):
     dot_scores = torch.matmul(q, k.transpose(-1, -2))
@@ -49,11 +659,10 @@ def rbf_scores(q, k, rbf_sigma=1.0, rbf_ratio=0.0):
     return (1 - rbf_ratio) * dot_scores + rbf_ratio * rbf_scores
 
 def sliding_window_mask(q_len, k_len, window, device):
-    # mask[i, j] = 1 if j in [i-window+1, i], else 0
     idxs = torch.arange(q_len, device=device).unsqueeze(1)
     jdxs = torch.arange(k_len, device=device).unsqueeze(0)
     mask = (jdxs >= (idxs - window + 1)) & (jdxs <= idxs)
-    return mask.float()  # shape: (q_len, k_len)
+    return mask.float()
 
 def mask_win(text_ctx, aud_ctx):
     mask = torch.tril(torch.ones(text_ctx, text_ctx, device=device, dtype=dtype), diagonal=0)
@@ -64,7 +673,7 @@ def mask_win(text_ctx, aud_ctx):
 def maskc(ctx, device):
     return torch.tril(torch.ones(ctx, ctx, device=device, dtype=dtype), diagonal=0)
 
-def create_attention_mask(batch_size, ctx, is_causal=True, padding_mask=None, device=None):
+def attention_mask(batch_size, ctx, is_causal=True, padding_mask=None, device=None):
     if is_causal:
         mask = torch.triu(torch.ones((ctx, ctx), device=device), diagonal=0)
         mask = mask.expand(batch_size, 1, ctx, ctx)
@@ -75,7 +684,7 @@ def create_attention_mask(batch_size, ctx, is_causal=True, padding_mask=None, de
         mask = (mask.bool() | (~padding_mask)).float()
     return mask
 
-def calculate_attentiona(q, k, v, mask=None, temp=1.0):
+def calculate_attention(q, k, v, mask=None, temp=1.0):
     scaled_q = q
     if temp != 1.0 and temp > 0:
         scaled_q = q * (1.0 / temp)**.5
@@ -103,7 +712,7 @@ class LocalOut(nn.Module):
 
     def _reshape_to_output(self, attn_output: Tensor) -> Tensor:
         batch, _, ctx, _ = attn_output.shape
-        return attn_output.transpose(1, 2).contiguous().view(batch, ctx, self.dims)   
+        return attn_output.transpose(1, 2).contiguous().view(batch, ctx, self.dims)      
 
 def qkv_init(dims, head):
     head_dim = dims // head
@@ -119,16 +728,16 @@ def qkv_init(dims, head):
 
 def shape(dims, head, q, k, v):
     batch_size = q.shape[0]
-    seq_len_q = q.shape[1]
-    seq_len_kv = k.shape[1]
+    ctx_q = q.shape[1]
+    ctx_kv = k.shape[1]
     head_dim = dims // head
 
-    q = q.view(batch_size, seq_len_q, head, head_dim).transpose(1, 2)
-    k = k.view(batch_size, seq_len_kv, head, head_dim).transpose(1, 2)
-    v = v.view(batch_size, seq_len_kv, head, head_dim).transpose(1, 2)
+    q = q.view(batch_size, ctx_q, head, head_dim).transpose(1, 2)
+    k = k.view(batch_size, ctx_kv, head, head_dim).transpose(1, 2)
+    v = v.view(batch_size, ctx_kv, head, head_dim).transpose(1, 2)
     return q, k, v
 
-def create_qkv(dims, head, q, k, v, x, xa):
+def qkv(dims, head, q, k, v, x, xa):
     head_dim = dims // head
     scale = head_dim ** -0.25
     q = q(x) * scale
@@ -139,66 +748,25 @@ def create_qkv(dims, head, q, k, v, x, xa):
         return tensor.view(batch, ctx, head, head_dim).transpose(1, 2).contiguous()
     return _shape(q), _shape(k), _shape(v)
 
-def calculate_attention(q, k, v, mask=None, temp=1.0):
-    scaled_q = q
-    if temp != 1.0 and temp > 0:
-        scaled_q = q * (1.0 / temp)**.5
-    out = scaled_dot_product_attention(scaled_q, k, v, is_causal=mask is not None and q.shape[1] > 1)        
-    return out
-
-class LocalOut(nn.Module):
-    def __init__(self, dims: int, head: int):
+class KVCache(nn.Module):
+    def __init__(self, max_batch_size, max_ctxgth, n_heads, head_dim, dtype=torch.bfloat16):
         super().__init__()
-        head_dim = dims // head
-        self.head_dim = head_dim
-        self.query_module = nn.Linear(head_dim, head_dim)
-        self.key_module = nn.Linear(head_dim, head_dim)
-        self.value_module = nn.Linear(head_dim, head_dim)
-        self.out_proj = nn.Linear(head_dim, head_dim)
-    
-    def _reshape_to_output(self, x):
-        return x
-      
-def mel_scale_scalar(freq: float) -> float:
-    return 1127.0 * math.log(1.0 + freq / 700.0)
+        cache_shape = (max_batch_size, n_heads, max_ctxgth, head_dim)
+        self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
+        self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
 
-def mel_scale(freq: Tensor) -> Tensor:
-    return 1127.0 * (1.0 + freq / 700.0).log()
+    def update(self, input_pos, k_val, v_val):
+        assert input_pos.shape[0] == k_val.shape[2]
 
-def trace_x(func):
-    def wrapper(*args, **kwargs):
-        print(f"Calling {func.__name__}")
-        result = func(*args, **kwargs)
-        if isinstance(result, torch.Tensor):
-            print(f"  {func.__name__} returned shape: {result.shape}")
-        return result
-    return wrapper
+        k_out = self.k_cache
+        v_out = self.v_cache
+        k_out[:, :, input_pos] = k_val
+        v_out[:, :, input_pos] = v_val
 
-def track_x(new_x, operation=""): 
-    x_id = [id(new_x)]
-    if new_x is None:
-        return new_x
-    current_id = id(new_x)
-    if current_id != x_id[0]:
-        print(f"x FLOW: {x_id[0]} → {current_id} in {operation}")
-        x_id[0] = current_id
-    else:
-        print(f"x REUSE: {current_id} in {operation}")
-    return new_x
-
-def track_xa(new_xa, operation=""): 
-    xa_id = [id(new_xa)] if new_xa is not None else [None]
-    if new_xa is None:
-        return new_xa
-    current_id = id(new_xa)
-    if current_id != xa_id[0]:
-        print(f"xa FLOW: {xa_id[0]} → {current_id} in {operation}")
-        xa_id[0] = current_id  # pyright: ignore[reportArgumentType, reportCallIssue]
-    else:
-        print(f"xa REUSE: {current_id} in {operation}")
-    return new_xa
+        return k_out, v_out
 
 def get_activation(act: str) -> nn.Module:
+
     act_map = {
         "gelu": nn.GELU(), 
         "relu": nn.ReLU(), 
@@ -214,7 +782,7 @@ def get_activation(act: str) -> nn.Module:
     return act_map.get(act, nn.GELU())
 
 def get_generation_config(param):
-    return GenerationConfig(    # type: ignore
+    return GenerationConfig(
         max_length=param.text_ctx,
         pad_token_id=getattr(param, "pad_token_id", 0),
         bos_token_id=getattr(param, "bos_token_id", 1),
@@ -231,8 +799,120 @@ def get_generation_config(param):
         use_cache=False,
         return_timestamps=False)
 
+class FEncoder(nn.Module):
+    def __init__(self, mels, dims, head, act="relu"):
+        super().__init__()
+        
+        self.head = head
+        self.head_dim = dims // head  
+
+        self.dims = dims
+        self.mels = mels
+        act_fn = get_activation(act)
+
+        self.encoder = nn.Sequential(
+           nn.Conv1d(mels, dims, kernel_size=3, stride=1, padding=1), act_fn,
+           nn.Conv1d(dims, dims, kernel_size=3, stride=1, padding=1), act_fn,
+           nn.Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
+
+        self.norm = RMSNorm(dims)
+        
+    def forward(self, x):
+        if x.dim() == 2:
+            x = x.unsqueeze(0)        
+        x = self.encoder(x).permute(0, 2, 1).contiguous().to(device=device, dtype=dtype)
+        x = self.norm(x)
+        return x
+
+class WEncoder(nn.Module):
+    def __init__(self, input_dims, dims, head, act="relu", downsample=True, target_length=None):
+        super().__init__()
+        
+        self.head = head
+        self.head_dim = dims // head
+        self.dims = dims
+        act_fn = get_activation(act)
+        self.target_length = target_length
+
+        if downsample:
+            self.encoder = nn.Sequential(
+                nn.Conv1d(1, dims, kernel_size=127, stride=64, bias=False),
+                nn.Conv1d(dims, 2 * dims, kernel_size=7, stride=3),
+                nn.Conv1d(2 * dims, dims, kernel_size=3, stride=2),
+                nn.GroupNorm(num_groups=1, num_channels=dims, eps=1e-5))
+        else:
+            self.encoder = nn.Sequential(
+               nn.Conv1d(input_dims, dims//4, kernel_size=15, stride=4, padding=7), act_fn,
+               nn.Conv1d(dims//4, dims//2, kernel_size=7, stride=2, padding=3), act_fn,
+               nn.Conv1d(dims//2, dims, kernel_size=5, stride=2, padding=2), act_fn)
+                
+    def _get_length(self, input_lengths: torch.LongTensor):
+        conv1_length = int((input_lengths - 127) / 64 + 1)
+        conv2_length = int((conv1_length - 7) / 3 + 1)
+        conv3_length = int((conv2_length - 3) / 2 + 1)
+        return conv3_length
+        
+    def forward(self, x):
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+        x = self.encoder(x).permute(0, 2, 1).contiguous()
+        if self.target_length and x.shape[1] != self.target_length:
+            x = F.adaptive_avg_pool1d(x.transpose(1, 2), self.target_length).transpose(1, 2)
+        return x
+
+class PEncoder(nn.Module):
+    def __init__(self, input_dims, dims, head, act="relu", attend_pitch=False):
+        super().__init__()
+        
+        self.head = head
+        self.head_dim = dims // head
+        self.dims = dims
+   
+        act_fn = get_activation(act)
+        self.attend_pitch = attend_pitch
+
+        if self.attend_pitch:
+            self.q, self.k, self.v, self.o, self.scale = qkv_init(dims, head)
+            self.mlp = nn.Sequential(
+                nn.Linear(dims, dims),
+                nn.ReLU(),
+                nn.Linear(dims, dims),
+            )
+        else:
+            self.q, self.k, self.v, self.o, self.scale = None, None, None, None, None
+            self.mlp = None
+
+        self.pitch_encoder = nn.Sequential(
+            nn.Conv1d(1, dims, kernel_size=3, stride=1, padding=1), act_fn,
+            nn.Conv1d(dims, dims, kernel_size=3, stride=1, padding=1), act_fn,
+            nn.Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
+        
+    def rope_to(self, x):
+        batch, ctx, dims = x.shape
+        x = x.view(batch, ctx, self.head, self.head_dim).permute(0, 2, 1, 3)
+        freqs = self.rope(ctx)
+        x = self.rope.apply_rotary(x, freqs)
+        x = x.permute(0, 2, 1, 3).contiguous().view(batch, ctx, dims)
+        return x.squeeze(0)
+        
+    def forward(self, x, xa=None):
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+        x = self.pitch_encoder(x).permute(0, 2, 1).contiguous()
+    
+        if self.mlp is not None:
+            x = self.mlp(x)
+
+        if self.attend_pitch:
+            if xa is not None:
+                q, k, v = qkv(self.q, self.k, self.v, x=xa, xa=x, head=self.head)
+                out, _ = calculate_attention(q, k, v, mask=None, temperature=1.0, is_causal=True)
+                x = x + out
+
+        return x
+
 class feature_encoder(nn.Module):
-    def __init__(self, mels, input_dims, dims, head, layer, act, features, feature=None, use_rope=False, spec_shape=None, debug=[], attend_feature=False, target_length=None):
+    def __init__(self, mels, input_dims, dims, head, layer, act, features, feature=None, use_rope=False, spec_shape=None, debug=[], attend=False, target_length=None):
         """
         Feature encoder for audio processing.
         """
@@ -243,42 +923,35 @@ class feature_encoder(nn.Module):
         self.head_dim = dims // head  
         self.dropout = 0.01 
         self.use_rope = use_rope
-        self.attend_feature = attend_feature
+        self.attend = attend
         self.target_length = target_length
         self.feature = feature
 
         self.debug = debug
         act_fn = get_activation(act)
 
-        if self.attend_feature:
-            # self.q, self.k, self.v, self.o, self.scale = qkv_init(dims, head)
+        if self.attend:
             self.mlp = nn.Sequential(nn.Linear(dims, dims), nn.ReLU(), nn.Linear(dims, dims))
         else:
             self.q, self.k, self.v, self.o, self.scale = None, None, None, None, None
             self.mlp = None
 
         self.spectrogram = nn.Sequential(
-            Conv1d(mels, dims, kernel_size=3), act_fn,
-            Conv1d(dims, dims, kernel_size=3), act_fn,
-            Conv1d(dims, dims, kernel_size=3, groups=dims), act_fn)
+           nn.Conv1d(mels, dims, kernel_size=3), act_fn,
+           nn.Conv1d(dims, dims, kernel_size=3), act_fn,
+           nn.Conv1d(dims, dims, kernel_size=3, groups=dims), act_fn)
 
         self.waveform = nn.Sequential(
-            Conv1d(1, dims//4, kernel_size=15, stride=4, padding=7), act_fn,
-            Conv1d(dims//4, dims//2, kernel_size=7, stride=2, padding=3), act_fn,
-            Conv1d(dims//2, dims, kernel_size=5, stride=2, padding=2), act_fn)
+           nn.Conv1d(1, dims//4, kernel_size=15, stride=4, padding=7), act_fn,
+           nn.Conv1d(dims//4, dims//2, kernel_size=7, stride=2, padding=3), act_fn,
+           nn.Conv1d(dims//2, dims, kernel_size=5, stride=2, padding=2), act_fn)
 
         self.pitch = nn.Sequential(
-            Conv1d(1, dims, kernel_size=7, stride=1, padding=3), act_fn,
-            Conv1d(dims, dims, kernel_size=5, stride=1, padding=2), act_fn,
-            Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
+           nn.Conv1d(1, dims, kernel_size=7, stride=1, padding=3), act_fn,
+           nn.Conv1d(dims, dims, kernel_size=5, stride=1, padding=2), act_fn,
+           nn.Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
 
-        if use_rope:
-            # if spec_shape is not None:
-            self.positional = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
-            self.rope = rotary(dims=dims, head=head, radii=False, debug=[], use_pbias=False, axial=False, spec_shape=spec_shape) # type: ignore
-        else:
-            self.rope = None # type: ignore
-            self.positional = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
+        self.positional = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
         self.norm = RMSNorm(dims)
 
     def rope(self, x, xa=None, mask=None, feats=None, feature=None, layer=None):
@@ -290,7 +963,7 @@ class feature_encoder(nn.Module):
 
             x = x.view(batch, ctx, self.head, self.head_dim).permute(0, 2, 1, 3)
         freqs = self.rope(ctx, feats=feats, feature=feature, layer=layer)
-        x = self.rope.apply_rotary(x, freqs)  # pyright: ignore[reportOptionalSubscript, reportAttributeAccessIssue]
+        x = self.rope.apply_rotary(x, freqs)
         x = x.permute(0, 2, 1, 3).contiguous().view(batch, ctx, dims)
         return x
 
@@ -305,10 +978,6 @@ class feature_encoder(nn.Module):
             enc_dict = feats if feats is not None else {}
             enc_dict = dict(enc_dict)  
             enc_dict["f0"] = xp
-            # xp = self.mel_scalar(xp.mean())
-            # print(f"Using pitch scalar: {xp}")
-            # max_tscale = xp*300
-            # print(f"Using max_tscale: {max_tscale}")
             feats = enc_dict
             if x.dim() == 2:
                 x = x.unsqueeze(0)
@@ -350,13 +1019,6 @@ class feature_encoder(nn.Module):
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
         x = self.norm(x)
 
-        if self.attend_feature:
-            xa = feats[feature]  # pyright: ignore[reportOptionalSubscript]
-            if xa is not None:
-                q, k, v = create_qkv(self.q, self.k, self.v, x=xa, xa=x, head=self.head)
-                out, _ = calculate_attention(q, k, v, mask=None, temperature=1.0, is_causal=True)
-                x = x + out
-
         x = nn.functional.dropout(x, p=self.dropout, training=self.training)
         x = self.norm(x)
         return x
@@ -379,6 +1041,7 @@ class OneShot(nn.Module):
         q = self.q(x).view(B, L, self.head, self.head_dim).transpose(1,2)
         k = self.k(xa).view(B, K, self.head, self.head_dim).transpose(1,2)
         bias = (q @ k.transpose(-1, -2)) * self.scale / math.sqrt(self.head_dim)
+
         return bias
 
 class curiosity(nn.Module):
@@ -400,6 +1063,7 @@ class curiosity(nn.Module):
         return x.transpose(1, 2).contiguous().view(b, t, h * dh)
 
     def forward(self, x, xa, mask=None):
+
         q, k, v   = self.qkv(x).chunk(3, -1)
         qa, ka, va = self.qkv_aux(xa).chunk(3, -1)
         q, k, v   = map(self.split, (q, k, v))
@@ -415,48 +1079,10 @@ class curiosity(nn.Module):
         out = self.merge(h_main * (1 - g) + h_aux * g)
         return self.o(out)
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, dims, ctx):
-        super(PositionalEncoding, self).__init__()
-        self.dims = dims
-        self.ctx = ctx
-        self.pe = self.get_positional_encoding(max_ctx=ctx)
-
-    def get_positional_encoding(self, max_ctx):
-        pe = torch.zeros(max_ctx, self.dims)
-        position = torch.arange(0, max_ctx, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, self.dims, 2, dtype=torch.float32)
-            * (-math.log(10000.0) / self.dims)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        return pe.to(device)
-
-    def forward(self, x):
-        ctx = x.size(1)
-        pe = self.pe[:, :ctx, :]
-        x = x * math.sqrt(self.dims)
-        x = x + pe
-        return x
-
-def valid(default_value, *items):
-    """Get first non-None item"""
-    for item in items:
-        if item is not None:
-            return item
-    return default_value
-
-def dict_to(d, device, dtype=dtype):
-    return {k: v.to(device, dtype) if isinstance(v, torch.Tensor) else v 
-            for k, v in d.items()}
-    
-def exists(v): # stolen from lucidbrains
-    return v is not None
-
-def default(v, b): # this too
-    return v if exists(v) else b
+class Conv2d(nn.Conv2d):
+    def _conv_forward(
+        self, x: Tensor, weight: Tensor, bias) -> Tensor:
+        return super()._conv_forward(x, weight.to(x.device, x.dtype), None if bias is None else bias.to(x.device, x.dtype))
 
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, bias: bool = True) -> None:
@@ -479,46 +1105,17 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.elementwise_affine = elementwise_affine
         if self.elementwise_affine:
-            self.weight = nn.Parameter(torch.empty(self.normalized_shape))  # type: ignore
+            self.weight = nn.Parameter(torch.empty(self.normalized_shape))
             init.ones_(self.weight)  
         else:
             self.register_parameter("weight", None)
     def forward(self, x):
-        return F.rms_norm(x, self.normalized_shape, self.weight, self.eps)  # type: ignore
+        return F.rms_norm(x, self.normalized_shape, self.weight, self.eps)
     
 def LayerNorm(x: Tensor, normalized_shape: Union[int, Tensor, List, Tuple],
                weight: Optional[Tensor] = None, bias: Optional[Tensor] = None,
                eps: float = 1e-5) -> Tensor:
-    return F.layer_norm(x, normalized_shape, weight, bias, eps)  # type: ignore
-
-def get_device():
-    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-def get_dtype():
-    return torch.float32 if torch.cuda.is_available() else torch.float64
-
-class sinusoid_emb(nn.Module):
-    def __init__(self, ctx: int, dims: int, max_tscale=10000):
-        super().__init__()
-        position = torch.arange(start=0, end=ctx, dtype=dtype).unsqueeze(dim=1)
-        div_term = torch.exp(input=torch.arange(start=0, end=dims, step=2, dtype=dtype) * -(torch.log(torch.tensor(float(max_tscale))) / dims))
-        features = torch.zeros(ctx, dims)
-        features[:, 0::2] = torch.sin(position * div_term)
-        features[:, 1::2] = torch.cos(position* div_term)
-        self.register_buffer('sinusoid', tensor=features)
-        self.positional_embeddings = nn.Parameter(self.sinusoid.clone()) # type: ignore
-    def forward(self, positions):
-        position_embeddings = self.positional_embeddings[positions]
-        return position_embeddings
-
-def sinusoids(ctx, dims, max_tscale=10000):
-    assert dims % 2 == 0
-    pos = torch.log(torch.tensor(float(max_tscale))) / (dims // 2 - 1)
-    tscales = torch.exp(-pos * torch.arange(dims // 2, device=device, dtype=torch.float32))
-    scaled = torch.arange(ctx, device=device, dtype=torch.float32).unsqueeze(1) * tscales.unsqueeze(0)
-    position = torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=1) 
-    positional_embedding = nn.Parameter(position, requires_grad=True)
-    return positional_embedding
+    return F.layer_norm(x, normalized_shape, weight, bias, eps)
 
 class SelfCriticalRL(nn.Module):
     def __init__(self, model, tokenizer, reward_fn):
@@ -537,14 +1134,14 @@ class SelfCriticalRL(nn.Module):
         
         rewards = []
         baseline = []
-        for s, g, ref in zip(sampled_text, greedy_text, labels): # type: ignore
+        for s, g, ref in zip(sampled_text, greedy_text, labels):
             ref_text = self.tokenizer.decode(ref)
             rewards.append(self.reward_fn(s, ref_text))
             baseline.append(self.reward_fn(g, ref_text))
         rewards = torch.tensor(rewards, device=device, dtype=torch.float)
         baseline = torch.tensor(baseline, device=device, dtype=torch.float)
         advantage = rewards - baseline
-        logits = self.model(input_ids=sampled_ids, **{feature_name: features})["logits"]  # logits: [batch, sampled_seq_len, vocab_size]
+        logits = self.model(input_ids=sampled_ids, **{feature_name: features})["logits"]
         log_probs = F.log_softmax(logits, dim=-1)
         log_probs_seq = torch.gather(log_probs, 2, sampled_ids.unsqueeze(-1)).squeeze(-1)
         log_probs_sum = log_probs_seq.sum(dim=1)
@@ -584,7 +1181,6 @@ def confidence_indicator(pred_ids, model, features):
     return max_probs.mean(dim=1)
 
 def wer_reward(hyp, ref):
-
     hyp_words = hyp.split()
     ref_words = ref.split()
     d = [[0] * (len(ref_words)+1) for _ in range(len(hyp_words)+1)]
@@ -599,7 +1195,7 @@ def wer_reward(hyp, ref):
             else:
                 d[i][j] = 1 + min(d[i-1][j], d[i][j-1], d[i-1][j-1])
     wer = d[-1][-1] / max(1, len(ref_words))
-    return -wer  # negative WER as reward
+    return -wer
 
 def clean_ids(ids, pad_token_id=0, bos_token_id=1, eos_token_id=2):
     if isinstance(ids, torch.Tensor):
@@ -650,21 +1246,28 @@ def setup_tokenizer(dir: str):
     tokenizer.eos_token_id = 2
     return tokenizer
 
-def tokenize_pitch(pitch_features, target_length):
-    pitch_len = pitch_features.shape[-1]
-    token_len = target_length
-    if pitch_len > token_len:
-        pitch_tokens = F.adaptive_avg_pool1d(pitch_features, token_len)
+def tokenize_feature(audio, labels):
+    if isinstance(audio, torch.Tensor):
+        if audio.dim() == 1:
+            ctx = audio.unsqueeze(0).unsqueeze(0)
+        elif audio.dim() == 2:
+            ctx = audio.unsqueeze(1)
+        elif audio.dim() == 3:
+            ctx = audio
+    target_length = len(labels)
+    current_length = ctx.shape[-1]
+    if current_length > target_length:
+        tokens = F.adaptive_avg_pool1d(ctx, target_length)
     else:
-        pitch_tokens = F.interpolate(pitch_features, token_len)
-    return pitch_tokens
+        tokens = F.interpolate(ctx, size=target_length, mode='linear', align_corners=False)
+    return tokens
 
 def load_wave(wave_data, sample_rate=16000):
     if isinstance(wave_data, str):
-        waveform, sample_rate = torchaudio.load(uri=wave_data, normalize=False)
+        waveform, sample_rate = torchaudio.load(uri=wave_data, normalize=True, backend="ffmpeg")
     elif isinstance(wave_data, dict):
         waveform = torch.tensor(data=wave_data["array"]).float()
-        sample_rate = wave_data["sampling_rate"]  # noqa: F841
+        sample_rate = wave_data["sampling_rate"]
     else:
         raise TypeError("Invalid wave_data format.")
     return waveform
@@ -673,17 +1276,11 @@ def world_to_mel(sp, ap, sample_rate=16000, n_mels=128):
     import librosa
     mel_basis = librosa.filters.mel(sr=sample_rate, n_fft=1024, n_mels=n_mels)
     mel_basis = torch.from_numpy(mel_basis).float()
-    sp_mel = torch.matmul(sp, mel_basis.T)  # (frames, 128)
-    ap_mel = torch.matmul(ap, mel_basis.T)  # (frames, 128)
+    sp_mel = torch.matmul(sp, mel_basis.T)
+    ap_mel = torch.matmul(ap, mel_basis.T)
     return sp_mel, ap_mel
 
-def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=False, pitch=False, harmonics=False, sample_rate=16000, hop_length=256, mode="mean", debug=False, phase_mod=False, crepe=False, aperiodics=False, dummy=False):
-
-    import torch
-    import torchaudio
-    import torchaudio.functional as F
-    import torchaudio.transforms as T
-
+def spectrogram(audio, sample_rate=16000, n_fft=1024, hop_length=256, window_fn=torch.hann_window):
     torch_windows = {
         'hann': torch.hann_window,
         'hamming': torch.hamming_window,
@@ -692,40 +1289,293 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
         'ones': torch.ones,
         None: torch.ones,
     }
-    if dummy:
-        return {
-            "spectrogram": torch.zeros((1, 128, 100)),
-            "f0": torch.zeros((1, 100)),
-            "pitch_tokens": torch.zeros((1, 100)),
-            "pitch": torch.zeros((1, 100)),
-            "harmonics": torch.zeros((1, 128, 100)),
-            "aperiodics": torch.zeros((1, 128, 100)),
-            "crepe_time": None,
-            "crepe_frequency": None,
-            "crepe_confidence": None,
-            "crepe_activation": None,
-        }
 
-    audio = batch["audio"]
-    sample_rate = audio["sampling_rate"]
-    audio_length = len(audio["array"]) / audio["sampling_rate"]
-    labels = tokenizer.encode(batch["transcription"])
-    sentence_length = len(batch["transcription"]) 
-    wav = load_wave(wave_data=audio, sample_rate=sample_rate)
+    if isinstance(window_fn, str):
+        window_fn = torch_windows[window_fn]
+    if window_fn is None:
+        window_fn = torch.ones(n_fft)
+    if isinstance(window_fn, torch.Tensor):
+        window_fn = window_fn.to(device)
+    return torchaudio.functional.spectrogram(
+        audio, n_fft=n_fft, hop_length=hop_length, win_length=n_fft,
+        window=window_fn, center=True, pad_mode="reflect", power=1.0)
+
+def exact_div(x, y):
+    assert x % y == 0
+    return x // y
+
+def load_audio(file: str, sr: int = 16000):
+
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-threads", "0",
+        "-i", file,
+        "-f", "s16le",
+        "-ac", "1",
+        "-acodec", "pcm_s16le",
+        "-ar", str(sr),
+        "-"
+    ]
     
-    def crepe_predict(wav, sample_rate, viterbi=False):
-        import torchcrepe
-        wav = wav.numpy().astype(np.float32)
-        time, frequency, confidence, activation = torchcrepe.predict(
-            wav, sample_rate=sample_rate, viterbi=viterbi)
-        crepe_time = torch.from_numpy(time)
-        crepe_frequency = torch.from_numpy(frequency)
-        crepe_confidence = torch.from_numpy(confidence)
-        crepe_activation = torch.from_numpy(activation)
-        return crepe_time, crepe_frequency, crepe_confidence, crepe_activation
+    try:
+        out = run(cmd, capture_output=True, check=True).stdout
+    except CalledProcessError as e:
+        raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
+    return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
 
+def pad_or_trim(array, length: int = 30, *, axis: int = -1):
+    if torch.is_tensor(array):
+        if array.shape[axis] > length:
+            array = array.index_select(
+                dim=axis, index=torch.arange(length, device=array.device))
+
+        if array.shape[axis] < length:
+            pad_widths = [(0, 0)] * array.ndim
+            pad_widths[axis] = (0, length - array.shape[axis])
+            array = F.pad(array, [pad for sizes in pad_widths[::-1] for pad in sizes])
+    else:
+        if array.shape[axis] > length:
+            array = array.take(indices=range(length), axis=axis)
+
+        if array.shape[axis] < length:
+            pad_widths = [(0, 0)] * array.ndim
+            pad_widths[axis] = (0, length - array.shape[axis])
+            array = np.pad(array, pad_widths)
+    return array
+
+@lru_cache(maxsize=None)
+def mel_filters(device, n_mels: int) -> torch.Tensor:
+    assert n_mels in {80, 128}, f"Unsupported n_mels: {n_mels}"
+    filters_path = "D:/newmodel/mod6/mel_filters.npz"
+    with np.load(filters_path, allow_pickle=False) as f:
+        return torch.from_numpy(f[f"mel_{n_mels}"]).to(device)
+
+def mel_spectrogram(
+    audio: Union[str, np.ndarray, torch.Tensor],
+    n_mels: int = 128,
+    n_fft = 400,
+    hop_length = 160,
+    padding: int = 0,
+    device: Optional[Union[str, torch.device]] = None,
+):
+
+    if not torch.is_tensor(audio):
+        if isinstance(audio, str):
+            audio = load_audio(audio)
+        audio = torch.from_numpy(audio)
+
+    if device is not None:
+        audio = audio.to(device)
+    if padding > 0:
+        audio = F.pad(audio, (0, padding))
+    window = torch.hann_window(n_fft).to(audio.device)
+    stft = torch.stft(audio, n_fft, hop_length, window=window, return_complex=True)
+    magnitudes = stft[..., :-1].abs() ** 2
+
+    filters = mel_filters(audio.device, n_mels)
+    mel_spec = filters @ magnitudes
+
+    log_spec = torch.clamp(mel_spec, min=1e-10).log10()
+    log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
+    spectrogram_tensor = (log_spec + 4.0) / 4.0
+    return spectrogram_tensor
+
+def audio_token(audio, labels, sample_rate=16000, hop_length=256, strides=1):
+
+    frames_per_second = exact_div(sample_rate, hop_length)  
+    tokens_per_second = exact_div(sample_rate,  hop_length * strides)
+    return tokens_per_second
+
+def harmonics_and_aperiodics(audio, f0, t, sample_rate):
+    import pyworld as pw
+    wav_np = audio.numpy().astype(np.float64)
+    sp = pw.cheaptrick(wav_np, f0, t, sample_rate, fft_size=256)
+    ap = pw.d4c(wav_np, f0, t, sample_rate, fft_size=256)
+    harmonic_tensor = torch.from_numpy(sp)
+    aperiodic_tensor = torch.from_numpy(ap)
+    harmonic_tensor = harmonic_tensor[:, :128].contiguous().T
+    aperiodic_tensor = aperiodic_tensor[:, :128].contiguous().T
+    harmonic_tensor = torch.where(harmonic_tensor == 0.0, torch.zeros_like(harmonic_tensor), harmonic_tensor / 1.0)
+    aperiodic_tensor = torch.where(aperiodic_tensor == 0.0, torch.zeros_like(aperiodic_tensor), aperiodic_tensor / 1.0)
+    return harmonic_tensor, aperiodic_tensor
+
+def mfcc(audio, sample_rate, n_mels, n_fft, hop_length, window_fn=torch.hann_window):
+    transform = torchaudio.transforms.MFCC(
+        sample_rate=sample_rate,
+        n_mfcc=n_mels,
+        melkwargs={
+            "n_fft": n_fft,
+            "hop_length": hop_length,
+            "window_fn": window_fn,
+            "n_mels": n_mels,
+            "center": True,
+            "pad_mode": "reflect",
+            "norm": None,
+            "mel_scale": "htk",
+        }
+    )
+    mfcc_tensor = transform(audio)
+    return mfcc_tensor
+
+def safe_div(n, d, eps = 1e-6):
+    return n.div_(d + eps)
+
+def lcm(*numbers):
+    return int(reduce(lambda x, y: int((x * y) / gcd(x, y)), numbers, 1))
+
+def merge_dims(ind_from, ind_to, tensor):
+    shape = list(tensor.shape)
+    arr_slice = slice(ind_from, ind_to + 1)
+    shape[arr_slice] = [reduce(mul, shape[arr_slice])]
+    return tensor.reshape(*shape)
+
+def expand_dim(t, dim, k, unsqueeze=True):
+    if unsqueeze:
+        t = t.unsqueeze(dim)
+    expand_shape = [-1] * len(t.shape)
+    expand_shape[dim] = k
+    return t.expand(*expand_shape)
+
+def split_at_index(dim, index, t):
+    pre_slices = (slice(None),) * dim
+    l = (*pre_slices, slice(None, index))
+    r = (*pre_slices, slice(index, None))
+    return t[l], t[r]
+
+def max_neg(tensor):
+    return -torch.finfo(tensor.dtype).max
+
+def pitch_tokens(audio, labels, sample_rate=16000, hop_length=160, mode="mean", audio_bos=None):
+    f0, t = pw.dio(audio.numpy().astype(np.float64), sample_rate, frame_period=hop_length / sample_rate * 1000)
+    f0 = pw.stonemask(audio.numpy().astype(np.float64), f0, t, sample_rate)
+    duration = len(audio) / sample_rate
+    T = len(labels)
+    tok_dur = duration / T
+    starts = torch.arange(T) * tok_dur
+    ends = starts + tok_dur
+    start = torch.searchsorted(torch.from_numpy(t), starts, side="left")
+    end = torch.searchsorted(torch.from_numpy(t), ends, side="right")
+    ptok = torch.zeros(T, dtype=torch.float32)
+    for i in range(T):
+        lo, hi = start[i], max(start[i]+1, end[i])
+        seg = torch.from_numpy(f0)[lo:hi]
+        if mode == "mean":
+            ptok[i] = seg.mean()
+        elif mode == "median":
+            ptok[i] = torch.median(seg)
+        else:
+            ptok[i] = seg[-1]
+    ptok[ptok < 100.0] = 0.0
+    bos_token = audio_bos if audio_bos is not None else (ptok[0] if len(ptok) > 0 else 0.0)
+    tensor = torch.cat([torch.tensor([bos_token]), ptok])
+    return torch.where(tensor == 0.0, torch.zeros_like(tensor), (tensor - 71.0) / (500.0 - 71.0))
+
+class DynamicLayerNorm(nn.Module):
+    def __init__(self, normalized_shape, summary_vector_dim):
+        super(DynamicLayerNorm, self).__init__()
+        self.normalized_shape = normalized_shape
+        self.gamma_generator = nn.Linear(summary_vector_dim, normalized_shape)
+        self.beta_generator = nn.Linear(summary_vector_dim, normalized_shape)
+
+    def forward(self, x, summary_vector):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        x_norm = (x - mean) / torch.sqrt(var + 1e-5)
+        gamma = self.gamma_generator(summary_vector)
+        beta = self.beta_generator(summary_vector)
+        return gamma * x_norm + beta
+
+class vDynamicLayerNorm(nn.Module):
+    def __init__(self, normalized_shape, summary_vector_dim):
+        super(vDynamicLayerNorm, self).__init__()
+        self.normalized_shape = normalized_shape
+        self.gamma_generator = nn.Linear(summary_vector_dim, normalized_shape)
+        self.beta_generator = nn.Linear(summary_vector_dim, normalized_shape)
+
+    def forward(self, x, summary_vector):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        x_norm = (x - mean) / torch.sqrt(var + 1e-5)
+        gamma = self.gamma_generator(summary_vector)
+        beta = self.beta_generator(summary_vector)
+        gamma = gamma.unsqueeze(1)
+        beta = beta.unsqueeze(1)
+        return gamma * x_norm + beta
+
+class SummaryVector(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, summary_vector_dim, output_dim):
+        super(SummaryVector, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.dln = vDynamicLayerNorm(hidden_dim, summary_vector_dim) 
+        self.fc = nn.Linear(hidden_dim, output_dim)
+        self.summary_lstm = nn.LSTM(input_dim, summary_vector_dim, 1, batch_first=True)
+
+    def forward(self, x):
+        _, (summary_vector, _) = self.summary_lstm(x)
+        summary_vector = summary_vector.squeeze(0)
+        lstm_output, _ = self.lstm(x) 
+        normalized_lstm_output = self.dln(lstm_output, summary_vector)
+        output = self.fc(normalized_lstm_output)
+        return output
+
+class aSummaryVector(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, summary_vector_dim, output_dim):
+        super(SummaryVector, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+
+        self.dln = DynamicLayerNorm(hidden_dim, summary_vector_dim) 
+        self.fc = nn.Linear(hidden_dim, output_dim)
+        self.summary_extractor = nn.Linear(input_dim, summary_vector_dim)
+
+    def forward(self, x):
+        summary_vector = self.summary_extractor(x.mean(dim=1)) 
+        lstm_output, _ = self.lstm(x) 
+        normalized_lstm_output = self.dln(lstm_output, summary_vector)
+        output = self.fc(normalized_lstm_output)
+        return output
+
+class AttentionPooling(nn.Module):
+    def __init__(self, encoder_hidden_dim):
+        super(AttentionPooling, self).__init__()
+        self.attention_query_generator = nn.Linear(encoder_hidden_dim, encoder_hidden_dim)
+        self.attention_mechanism = nn.Linear(encoder_hidden_dim, 1)
+
+    def forward(self, encoder_outputs):
+        query = torch.mean(encoder_outputs, dim=1)
+        scores = self.attention_mechanism(torch.tanh(encoder_outputs + self.attention_query_generator(query).unsqueeze(1)))
+        attention_weights = F.softmax(scores, dim=1)
+        pooled_output = torch.sum(attention_weights * encoder_outputs, dim=1)
+        return pooled_output, attention_weights
+
+class SummaryVector_Attention(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, summary_vector_dim, output_dim):
+        super(SummaryVector_Attention, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.attention_pooling = AttentionPooling(hidden_dim)
+        self.dln = DynamicLayerNorm(hidden_dim, summary_vector_dim) 
+        self.fc = nn.Linear(hidden_dim, output_dim)
+        self.summary_extractor = nn.LSTM(input_dim, summary_vector_dim, 1, batch_first=True) 
+
+    def forward(self, x):
+        _, (summary_vector, _) = self.summary_lstm(x)
+        summary_vector = summary_vector.squeeze(0)
+        lstm_output, _ = self.lstm(x) 
+        context_vector, attention_weights = self.attention_pooling(lstm_output)
+        lstm_output, _ = self.lstm(x) 
+        summary_vector_from_attention, attention_weights_viz = self.attention_pooling(lstm_output)        
+        normalized_lstm_output = self.dln(lstm_output, summary_vector_from_attention)
+        output = self.fc(normalized_lstm_output.mean(dim=1))
+        return output
+
+def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=False, pitch=False, harmonics=False, sample_rate=16000, hop_length=256, mode="mean", debug=False, phase_mod=False, crepe=False, aperiodics=False, dummy=False, mels=128, n_fft= 1024):
+
+    sample_rate = batch["audio"]["sampling_rate"]
+    labels = tokenizer.encode(batch["transcription"])
+    audio = load_wave(batch["audio"], sample_rate)
+        
     if crepe:
-        crepe_time, crepe_frequency, crepe_confidence, crepe_activation = crepe_predict(wav, sample_rate, viterbi=True)
+        crepe_time, crepe_frequency, crepe_confidence, crepe_activation = crepe_predict(audio, sample_rate, viterbi=True)
 
     else:
         crepe_time = None
@@ -733,18 +1583,8 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
         crepe_confidence = None
         crepe_activation = None
 
-    def spectrogram(wav, sample_rate, n_fft=1024, hop_length=256, window_fn=torch.hann_window):
-        if isinstance(window_fn, str):
-            window_fn = torch_windows[window_fn]
-        if window_fn is None:
-            window_fn = torch.ones(n_fft)
-        if isinstance(window_fn, torch.Tensor):
-            window_fn = window_fn.to(device)
-        return torchaudio.functional.spectrogram(
-            wav, n_fft=n_fft, hop_length=hop_length, win_length=n_fft,
-            window=window_fn, center=True, pad_mode="reflect", power=1.0)
+    def mel_spectrogram(audio, sample_rate):
 
-    def mel_spectrogram(wav, sample_rate):
         spectrogram_config = {
             "hop_length": 256,
             "f_min": 150,
@@ -761,54 +1601,29 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
             "normalized": False,
         }
         transform = torchaudio.transforms.MelSpectrogram(**spectrogram_config)
-        mel_spectrogram = transform(wav)
+        mel_spectrogram = transform(audio)
         log_mel = torch.clamp(mel_spectrogram, min=1e-10).log10()
         log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
         spectrogram_tensor = (log_mel + 4.0) / 4.0
         return spectrogram_tensor
+
     if spec: 
-        spectrogram_tensor = mel_spectrogram(wav, sample_rate)
+        if dummy:
+            spectrogram_tensor = torch.ones(mels, 1024)
+        else:
+            spectrogram_tensor = mel_spectrogram(audio, sample_rate)
+    else:
+        spectrogram_tensor = None
 
-    def mfcc(wav, sample_rate, n_mels=128, n_fft=1024, hop_length=256, window_fn=torch.hann_window):
-        transform = torchaudio.transforms.MFCC(
-            sample_rate=sample_rate,
-            n_mfcc=n_mels,
-            melkwargs={
-                "n_fft": n_fft,
-                "hop_length": hop_length,
-                "window_fn": window_fn,
-                "n_mels": n_mels,
-                "center": True,
-                "pad_mode": "reflect",
-                "norm": None,
-                "mel_scale": "htk",
-            }
-        )
-        mfcc_tensor = transform(wav)
-        return mfcc_tensor
-
-    def harmonics_and_aperiodics(wav, f0, t, sample_rate):
-        import pyworld as pw
-        wav_np = wav.numpy().astype(np.float64)
-        sp = pw.cheaptrick(wav_np, f0, t, sample_rate, fft_size=256)
-        ap = pw.d4c(wav_np, f0, t, sample_rate, fft_size=256)
-        harmonic_tensor = torch.from_numpy(sp)
-        aperiodic_tensor = torch.from_numpy(ap)
-        harmonic_tensor = harmonic_tensor[:, :128].contiguous().T
-        aperiodic_tensor = aperiodic_tensor[:, :128].contiguous().T
-        harmonic_tensor = torch.where(harmonic_tensor == 0.0, torch.zeros_like(harmonic_tensor), harmonic_tensor / 1.0)
-        aperiodic_tensor = torch.where(aperiodic_tensor == 0.0, torch.zeros_like(aperiodic_tensor), aperiodic_tensor / 1.0)
-        return harmonic_tensor, aperiodic_tensor
-
-    if pitch or pitch_tokens or harmonics or aperiodics:
-        wavnp = wav.numpy().astype(np.float64)
+    if pitch_tokens or harmonics or aperiodics:
+        wavnp = audio.numpy().astype(np.float64)
         f0_np, t = pw.dio(wavnp, sample_rate, frame_period=hop_length / sample_rate * 1000)
         f0_np = pw.stonemask(wavnp, f0_np, t, sample_rate)
 
     if pitch_tokens:
-        wav = torch.from_numpy(wavnp)
+        audio = torch.from_numpy(wavnp)
         t2 = torch.from_numpy(t)
-        audio_duration = len(wav) / sample_rate
+        audio_duration = len(audio) / sample_rate
         T = len(labels)
         tok_dur_sec = audio_duration / T
         token_starts = torch.arange(T) * tok_dur_sec
@@ -817,7 +1632,7 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
         end_idx = torch.searchsorted(t2, token_ends, side="right")
         pitch_tok = torch.zeros(T, dtype=torch.float32)
         for i in range(T):
-            lo, hi = start_idx[i], max(start_idx[i]+1, end_idx[i]) # type: ignore
+            lo, hi = start_idx[i], max(start_idx[i]+1, end_idx[i])
             segment = f0_np[lo:hi]
             if mode == "mean":
                 pitch_tok[i] = segment.mean()
@@ -835,7 +1650,7 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
     if phase_mod:
         tframe = torch.mean(t2[1:] - t2[:-1])
         phi0 = 0.0
-        omega = 2 * torch.pi * f0_tensor # type: ignore
+        omega = 2 * torch.pi * f0_tensor
         dphi = omega * tframe
         phi = torch.cumsum(dphi, dim=0) + phi0
         phase = torch.remainder(phi, 2 * torch.pi)
@@ -843,9 +1658,11 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
         phase = None
 
     if pitch:
-        p_tensor = torchaudio.functional.detect_pitch_frequency(wav, sample_rate)
-        # p_tensor = torch.from_numpy(f0_np)
-        # p_tensor = p_tensor.unsqueeze(0) 
+        if dummy:
+            p_tensor = torch.ones(1, 1024)
+        else:
+            p_tensor = torchaudio.functional.detect_pitch_frequency(audio, sample_rate).unsqueeze(0)
+
     else:
         p_tensor = None
 
@@ -863,24 +1680,10 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
         aperiodic_tensor = None
 
     if waveform:
-        wave_tensor = wav
+        wave_tensor = audio
     else:
         wave_tensor = None
 
-    if dummy:   
-        if spectrogram_tensor is not None:
-            dummy_tensor = torch.ones_like(spectrogram_tensor)
-        elif p_tensor is not None:
-            dummy_tensor = torch.ones_like(p_tensor) 
-        elif pitch_tokens_tensor is not None:
-            dummy_tensor = torch.ones_like(pitch_tokens_tensor)
-        else:
-            batch_size = 128
-            seq_len = 1024
-            dummy_tensor = torch.ones(batch_size, seq_len)
-            dummy_tensor = dummy_tensor.to(device)
-    else:
-        dummy_tensor = None
     if debug:
         print(f"['pitch_tokens']: {pitch_tokens_tensor.shape if pitch_tokens else None}")
         print(f"['harmonic']: {harmonic_tensor.shape if harmonics else None}")
@@ -894,7 +1697,6 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
         print(f"['crepe_frequency']: {crepe_frequency.shape if crepe else None}")
         print(f"['crepe_confidence']: {crepe_confidence.shape if crepe else None}")
         print(f"['crepe_activation']: {crepe_activation.shape if crepe else None}")
-        print(f"['dummy']: {dummy_tensor.shape if dummy else None}")
 
     return {
         "waveform": wave_tensor if waveform else None,
@@ -909,8 +1711,51 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
         "crepe_frequency": crepe_frequency if crepe else None,
         "crepe_confidence": crepe_confidence if crepe else None,
         "crepe_activation": crepe_activation if crepe else None,
-        "dummy": dummy_tensor if dummy else None,
     }
+
+def plot_waveform(waveform, sr, title="Waveform", ax=None):
+    waveform = waveform.numpy()
+
+    num_channels, num_frames = waveform.shape
+    time_axis = torch.arange(0, num_frames) / sr
+
+    if ax is None:
+        _, ax = plt.subplots(num_channels, 1)
+    ax.plot(time_axis, waveform[0], linewidth=1)
+    ax.grid(True)
+    ax.set_xlim([0, time_axis[-1]])
+    ax.set_title(title)
+
+def plot_spectrogram(specgram, title=None, ylabel="freq_bin", ax=None):
+    import librosa
+    if ax is None:
+        _, ax = plt.subplots(1, 1)
+    if title is not None:
+        ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.imshow(librosa.power_to_db(specgram), origin="lower", aspect="auto", interpolation="nearest")
+
+def plot_fbank(fbank, title=None):
+    fig, axs = plt.subplots(1, 1)
+    axs.set_title(title or "Filter bank")
+    axs.imshow(fbank, aspect="auto")
+    axs.set_ylabel("frequency bin")
+    axs.set_xlabel("mel bin")
+
+def plot_pitch(waveform, sr, pitch):
+    figure, axis = plt.subplots(1, 1)
+    axis.set_title("Pitch Feature")
+    axis.grid(True)
+
+    end_time = waveform.shape[1] / sr
+    time_axis = torch.linspace(0, end_time, waveform.shape[1])
+    axis.plot(time_axis, waveform[0], linewidth=1, color="gray", alpha=0.3)
+
+    axis2 = axis.twinx()
+    time_axis = torch.linspace(0, end_time, pitch.shape[1])
+    axis2.plot(time_axis, pitch[0], linewidth=2, label="Pitch", color="green")
+
+    axis2.legend(loc=0)
 
 def prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, streaming=False,
         load_saved=False, save_dataset=False, cache_dir=None, extract_args=None, max_ctx=2048):
@@ -962,9 +1807,6 @@ def prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, st
                     len(x["audio"]["array"]) > 0 and
                     len(x["audio"]["array"]) < max_ctx * 160)
 
-        # raw_train  = load_dataset("mozilla-foundation/common_voice_17_0", "en", token=token, split="train", trust_remote_code=True, streaming=True).rename_column("sentence", "transcription")
-        # raw_test = load_dataset("mozilla-foundation/common_voice_17_0", "en", token=token, split="test", trust_remote_code=True, streaming=True).rename_column("sentence", "transcription").take(1000)
-
         raw_train = load_dataset(
             "google/fleurs", "en_us", token=token, split="train", trust_remote_code=True, streaming=streaming).take(1000)
         raw_test = load_dataset(
@@ -978,194 +1820,430 @@ def prepare_datasets(tokenizer, token, sanity_check=False, sample_rate=16000, st
         test_dataset.save_to_disk(cache_file_test) if save_dataset is True else None
         return train_dataset, test_dataset
 
+class c_gate(nn.Module):
+    def __init__(self, dims, enabled=True):
+        super().__init__()
+        self.enabled = enabled
+        if enabled:
+            self.s_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
+            self.w_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
+            self.p_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
+            self.e_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
+            self.ph_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
+            self.integ = Linear(dims*5, dims)
+        
+    def forward(self, x, enc):
+        if not self.enabled:
+            return None
+        s_feat = enc.get("spectrogram", x)
+        w_feat = enc.get("waveform", x)
+        p_feat = enc.get("pitch", x)
+        e_feat = enc.get("envelope", x)
+        ph_feat = enc.get("phase", x)
+        s = self.s_gate(x) * s_feat
+        w = self.w_gate(x) * w_feat
+        p = self.p_gate(x) * p_feat
+        e = self.e_gate(x) * e_feat
+        ph = self.ph_gate(x) * ph_feat
+        comb = torch.cat([s, w, p, e, ph], dim=-1)
+        return self.integ(comb)
+
+class mgate(nn.Module):
+    def __init__(self, dims, mem=64):
+        super().__init__()
+        self.mk = nn.Parameter(torch.randn(mem, dims))
+        self.mv = nn.Parameter(torch.randn(mem, 1))
+        self.mg = nn.Sequential(Linear(dims, dims//2), nn.SiLU(), Linear(dims//2, 1))
+    def forward(self, x, cosim=False):
+        if cosim:
+            key = F.softmax(torch.matmul(F.normalize(x, p=2, dim=-1), F.normalize(self.mk, p=2, dim=-1).transpose(0, 1)) / math.sqrt(x.shape[-1]), dim=-1)
+        else:
+            key = F.softmax(torch.matmul(x, self.mk.transpose(0, 1)) / math.sqrt(x.shape[-1]), dim=-1)
+        return 0.5 * (torch.sigmoid(self.mg(x)) + torch.sigmoid(torch.matmul(key, self.mv)))
+
+class t_gate(nn.Module):
+    def __init__(self, dims: int, head: int, memory_size: int = 64, threshold: float = 0.8):
+        super().__init__()
+        self.dims=dims
+        self.mkeys = {}
+
+        self.xa_proj = nn.Linear(dims, dims)
+        self.activation = nn.Sigmoid()
+        self.pattern = lambda length: sinusoids(length, dims=dims)  
+        self.primer = torch.ones(1, 512, dims)
+
+    def forward(self, x) -> torch.Tensor: 
+        if x is None:
+            cur = self.primer
+            self.key = cur
+        else:
+            cur = self.pattern(x.shape[1]).to(device, dtype)
+    
+        self.mkeys["last"] = self.key
+        cur = self.xa_proj(cur.mean(dim=1)) 
+
+        for b in range(cur.size(0)):
+            cur_xa = cur[b]
+            score = -1.0
+            best = None
+            for last in self.mkeys.items():
+                last = self.mkeys["last"]
+                similarity = F.cosine_similarity(cur_xa, last, dim=0).mean()
+
+                if similarity > score:
+                    score = similarity
+                    best = best
+
+            gating_value = self.activation(torch.tensor(score))
+            if gating_value > self.threshold and best is not None:
+                self.key = cur
+            else:
+                self.key = last
+            threshold = apply_ste_threshold(x, self.threshold)
+        return threshold, self.key
+
+class StraightThroughThreshold(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, threshold):
+        binary_output = (x > threshold).float()
+        ctx.save_for_backward(x, threshold)
+        return binary_output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, threshold = ctx.saved_tensors
+        grad_x = grad_output.clone()
+        grad_threshold = None
+        return grad_x, grad_threshold
+
+apply_ste_threshold = StraightThroughThreshold.apply
+
+def sinusoidz(length, dims):
+    position = torch.arange(0, length, dtype=torch.float).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, dims, 2).float() * (-math.log(10000.0) / dims))
+    pe = torch.zeros(length, dims)
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe.unsqueeze(0)
+
+class t_gate(nn.Module):
+    def __init__(self, dims: int, head: int, threshold: float = 0.8):
+        super().__init__()
+        self.dims = dims
+        
+        self.register_buffer('last_key', torch.zeros(1, dims))
+        self.xa_proj = nn.Linear(dims, dims)
+        self.activation = nn.Sigmoid()
+        self.register_buffer('primer', torch.ones(1, 512, dims))
+        self.threshold = nn.Parameter(torch.tensor(threshold, dtype=torch.float32), requires_grad=True)
+
+    def forward(self, x: torch.Tensor): 
+        device, dtype = x.device, x.dtype if x is not None else self.primer.device, self.primer.dtype
+        if x is None:
+            cur_representation = self.primer.to(device, dtype).mean(dim=1)
+        else:
+            pattern_tensor = self.pattern(x.shape[1]).to(device, dtype)
+            cur_representation = pattern_tensor.mean(dim=1)
+
+        cur_proj = self.xa_proj(cur_representation)
+        expanded_last_key = self.last_key.expand(cur_proj.shape[0], -1) 
+        similarity_scores = F.cosine_similarity(cur_proj, expanded_last_key, dim=-1).unsqueeze(-1)
+        gating_value = self.activation(similarity_scores)
+        decision = apply_ste_threshold(gating_value, self.threshold)
+        self.last_key.copy_(cur_representation.detach()) 
+        return decision, gating_value
+
+class m_gate(nn.Module):
+    def __init__(self, dims, mem_size=64):
+        super().__init__()
+        self.enabled = enabled
+        if enabled:
+            self.m_key = nn.Parameter(torch.randn(mem_size, dims))
+            self.m_val = nn.Parameter(torch.randn(mem_size, 1))
+            self.gate_proj = nn.Sequential(Linear(dims, dims//2), nn.SiLU(), Linear(dims//2, 1))
+            
+    def forward(self, x):
+        d_gate = torch.sigmoid(self.gate_proj(x))
+        attention = torch.matmul(x, self.m_key.transpose(0, 1))
+        attention = F.softmax(attention / math.sqrt(x.shape[-1]), dim=-1)
+        m_gate = torch.matmul(attention, self.m_val)
+        m_gate = torch.sigmoid(m_gate)
+        return 0.5 * (d_gate + m_gate)
+
+class lgate(nn.Module):
+    def __init__(self, dims):
+        super().__init__()
+        self.gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
+    def forward(self, x):
+        return self.gate(x)
+
 class tgate(nn.Module):
-    def __init__(self, dims, num_types=4):
+    def __init__(self, dims, num_types=2):
         super().__init__()
         self.gates = nn.ModuleList([nn.Sequential(Linear(dims, 1), nn.Sigmoid()) for _ in range(num_types)])
         self.classifier = nn.Sequential(Linear(dims, num_types), nn.Softmax(dim=-1))
     def forward(self, x):
         types = self.classifier(x)
         gates = torch.stack([gate(x) for gate in self.gates], dim=-1)
-        cgate = torch.sum(gates * types.unsqueeze(2), dim=-1)
-        return cgate
+        return  torch.sum(gates * types.unsqueeze(2), dim=-1)
 
-def get_feature_encoder(feature: str, mels: int, input_dims: int, dims: int, head: int, layer: int, act=None, features=None) -> nn.Module:
+class CausalAttention(nn.Module):
+    def __init__(self, dims, head, ctx):
+        super().__init__()
+        self.q = nn.Linear(dims, dims)
+        self.k = nn.Linear(dims, dims * 2, bias=False)
+        self.n = nn.LayerNorm(dims) 
+        self.register_buffer('mask', torch.triu(torch.ones(ctx, ctx), diagonal=1)) 
+    def forward(self, x):
+        k, v = self.k(self.n(x)).chunk(2, dim=-1)
+        q = self.q(self.n(x))
+        qk = q @ k.transpose(1, 2) 
+        qk.masked_fill_(self.mask.bool()[:x.shape[1], :x.shape[1]], -torch.inf) 
+        w = torch.softmax(qk / k.shape[-1]**0.5, dim=-1)
+        return  w @ v
+
+class MultiHeadAttentionWrapper(nn.Module):
+    def __init__(self, dims, head, ctx):
+        super().__init__()
+        self.heads = nn.ModuleList([CausalAttention(dims, head, ctx) for _ in range(head)])
+    def forward(self, x):
+        return torch.cat([head(x) for head in self.heads], dim=-1)   
+
+class OneShot(nn.Module):
+    def __init__(self, dims: int, head: int, scale: float = 0.3):
+        super().__init__()
+        self.head  = head
+        self.hdim  = dims // head
+        self.scale = scale                      
+        self.q = nn.Linear(dims, dims)
+        self.k = nn.Linear(dims, dims)
+    def forward(self, x: torch.Tensor, xa: torch.Tensor) -> torch.Tensor | None:
+        B, Q, _ = x.shape
+        K = xa.size(1)
+        q = self.q(x).view(B, Q, self.head, self.hdim).transpose(1,2)  
+        k = self.k(xa).view(B, K, self.head, self.hdim).transpose(1,2)
+        return (q @ k.transpose(-1, -2)) * self.scale / math.sqrt(self.hdim) 
+
+class ContextualBiasingGate2(nn.Module):
+    def __init__(self, dims: int, head: int, memory_size: int, threshold: float = 0.8):
+        super().__init__()
+        self.dims = dims
+        self.head = head
+        self.memory_size = memory_size
+        self.threshold = threshold
+        self.mkeys = {}
+        self.xa_projection = nn.Linear(dims, dims)
+        self.tgate_activation = nn.Sigmoid()
+        self.head_bias_weights = nn.Parameter(torch.ones(head))
+        self.pattern = lambda length, dims, max_tscale: sinusoids(length, dims)  
+        self.embedding = nn.Embedding(self.pattern, dims)
+        self.one_shot = OneShot(dims, head)
+
+        for _ in range(memory_size):
+            pattern = lambda length, dims, max_tscale: sinusoids(length, dims) 
+            bias_weight = OneShot(dims, head)
+            self.mkeys[tuple(pattern.tolist())] = bias_weight
+
+    def forward(self, shot_bias: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        x = self.xa_projection(x.mean(dim=1))
+        last_x = []
+        previous_best = None 
+
+        for b in range(x.size(0)):
+            cur_x = x[b]
+            score = -1.0
+            current_best = None  
+
+            for pattern, bias in self.mkeys.items():
+                pattern_tensor = torch.tensor(pattern).to(cur_x.device)
+                similarity = F.cosine_similarity(cur_x, pattern_tensor, dim=0)
+
+                if similarity > score:
+                    score = similarity
+                    current_best = bias
+
+            gating_value = self.tgate_activation(score.unsqueeze(0))
+            current_shot_bias = shot_bias[b]
+
+            if gating_value > self.threshold and current_best is not None:
+                if previous_best is None or not torch.equal(current_best, previous_best):
+                    scaled_bias = current_shot_bias * (current_best.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1))
+                    last_x.append(scaled_bias)
+                else: 
+                    last_x.append(current_shot_bias)
+            else: 
+                last_.append(current_shot_bias)
+            previous_best = current_best 
+        return torch.stack(last_x, dim=0)
+
+class ContextualBias(nn.Module):
+    def __init__(self, dims: int, head: int, memory_size: int, threshold: float = 0.8):
+        super().__init__()
+        self.dims = dims
+        self.head = head
+        self.hdim = dims // head
+
+        self.q = nn.Linear(dims, dims)
+        self.k = nn.Linear(dims, dims)
+        self.v = nn.Linear(dims, dims)
+        self.one_shot = OneShot(dims, head)
+        self.biasing_gate = BiasingGate(dims, head)
+
+    def forward(self, x, xa) -> torch.Tensor:
+        B, Q, _ = x.shape
+        K = xa.size(1)
+        q = self.q(x).view(B, Q, self.head, self.hdim).transpose(1,2)
+        k = self.k(x if xa is None else xa).view(B, K, self.head, self.hdim).transpose(1,2)
+        v = self.v(x if xa is None else xa).view(B, K, self.head, self.hdim).transpose(1,2)
+        qk = (q @ k.transpose(-1, -2)) / math.sqrt(self.hdim)
+        x = self.one_shot(x, xa)
+        if x is not None:
+            bias = self.biasing_gate(x, xa)
+            qk = qk + bias
+        w = F.softmax(qk, dim=-1)
+        return (w @ v).transpose(1, 2).reshape(B, Q, self.dims)
+
+class BiasingGate(nn.Module):
+    def __init__(self, dims: int, head: int, memory_size: int = 64, threshold: float = 0.8):
+        super(BiasingGate, self).__init__()
+        self.memory_size = memory_size
+        self.threshold = threshold
+        self.mkeys = {}
+        self.xa_projection = nn.Linear(dims, dims)
+        self.activation = nn.Sigmoid()
+        self.head_bias_weights = nn.Parameter(torch.ones(head))
+        self.pattern = lambda length: sinusoids(length, dims=dims)  
+        self.one_shot = OneShot(dims, head)
+
+    def forward(self, x, xa) -> torch.Tensor:
+        if x is None:
+            return None
+
+        for _ in range(self.memory_size):
+            self.mkeys["pattern"] = self.pattern(xa.shape[1]).to(device, dtype)
+            bias_weights = x
+            self.mkeys["bias"] = bias_weights
+   
+        xa = self.xa_projection(xa.mean(dim=1))
+        logits = []
+
+        for b in range(xa.size(0)): 
+            cur_xa = xa[b]
+            score = -1.0
+            best_weights = None
+            for pattern, bias_weights in self.mkeys.items():
+                pattern = self.mkeys["pattern"]
+                pattern_tensor = torch.tensor(pattern).to(cur_xa.device)
+                similarity = F.cosine_similarity(cur_xa, pattern_tensor, dim=0).mean()
+
+                if similarity > score:
+                    score = similarity
+                    best_weights = bias_weights
+
+            score = torch.tensor(score)
+            gating_value = self.activation(score)
+            shot_bias = x[b]
+
+            if gating_value > self.threshold and best_weights is not None:
+                scaled_bias = shot_bias * (best_weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1))
+                logits.append(scaled_bias)
+            else:
+                logits.append(shot_bias)
+        return torch.stack(logits, dim=0)
+
+class BiasingGateB(nn.Module):
+    def __init__(self, dims: int, head: int, memory_size: int = 64, threshold: float = 0.8):
+        super(BiasingGate, self).__init__()
+        self.dims = dims
+        self.head = head
+        self.memory_size = memory_size
+        self.threshold = threshold
+        self.mkeys = {}
+        self.p = nn.Linear(dims, dims)
+        self.tgate = nn.Sigmoid()
+
+        self.pattern = lambda length, dims, max_tscale: sinusoids(length, dims)  
+        self.one_shot = OneShot(dims, head)
+
+        for _ in range(memory_size):
+            pattern = lambda length, dims, max_tscale: sinusoids(length, dims) 
+            bias_weight = OneShot(dims, head)
+            self.mkeys[tuple(pattern.tolist())] = bias_weight
+
+    def forward(self, x, xa) -> torch.Tensor:
+        B, T, _ = x.shape
+        input = self.p(x.mean(dim=1))
+        batch_gate_biases = []
+        for b in range(B):
+            cur_input = input[b]
+            score = -1.0
+            best_match = None
+            for pattern, gate_bias in self.mkeys.items():
+                pattern_tensor = torch.tensor(pattern).to(cur_input.device)
+                similarity = F.cosine_similarity(cur_input, pattern_tensor, dim=0)
+                if similarity > score:
+                    score = similarity
+                    best_match = gate_bias
+            gating_value = self.tgate(score.unsqueeze(0))
+            if gating_value > self.threshold and best_match is not None:
+                batch_gate_biases.append(best_match.unsqueeze(0))
+            else:
+                batch_gate_biases.append(torch.zeros(1, self.head).to(x.device))
+        return torch.cat(batch_gate_biases, dim=0)
+
+class CuriosityHead(nn.Module):
+    def __init__(self, d, h, bias=True, memory_size=10, cb_threshold=0.7):
+        super().__init__()
+        self.h  = h
+        self.dh = d // h
+        self.qkv = nn.Linear(d, d * 3, bias=bias)
+        self.qkv_aux = nn.Linear(d, d * 3, bias=bias)
+        self.o  = nn.Linear(d, d, bias=bias)
+        self.g  = nn.Parameter(torch.zeros(h))
+        self.contextual_biasing_gate = BiasingGateB(d, h, memory_size, cb_threshold)
+
+    def split(self, x):
+        b, t, _ = x.shape
+        return x.view(b, t, self.h, self.dh).transpose(1, 2)
+
+    def merge(self, x):
+        b, h, t, dh = x.shape
+        return x.transpose(1, 2).contiguous().view(b, t, h * dh)
+
+    def forward(self, x, xa, mask=None):
+        q, k, v   = self.qkv(x).chunk(3, -1)
+        qa, ka, va = self.qkv_aux(xa).chunk(3, -1)
+        q, k, v   = map(self.split, (q, k, v))
+        qa, ka, va = map(self.split, (qa, ka, va))
+        dots      = (q @ k.transpose(-2, -1)) / self.dh**0.5
+        dots_aux  = (q @ ka.transpose(-2, -1)) / self.dh**0.5
+        if mask is not None: dots = dots.masked_fill(mask, -9e15)
+        p   = dots.softmax(-1)
+        pa  = dots_aux.softmax(-1)
+
+        h_main = p  @ v
+        h_aux  = pa @ va
+        contextual_gate_bias = self.contextual_biasing_gate(x)
+        g_biased_logits = self.g + contextual_gate_bias
+        g = torch.sigmoid(g_biased_logits).view(x.size(0), -1, 1, 1)
+        out = self.merge(h_main * (1 - g) + h_aux * g)
+        return self.o(out)
+
+def get_encoder(mels = None, input_dims = None, dims = None, head=None, act="relu", downsample = True, target_length = False, attend_pitch=False, feature = "spectrogram") -> nn.Module:
+
     if feature == "spectrogram":
-        return FEncoder(mels=mels, input_dims=input_dims, dims=dims, head=head, layer=layer, act=act, feature=feature, features=features)
+        return FEncoder(mels, dims, head, act, feature = "spectrogram")
     elif feature == "waveform":
-        return WEncoder(input_dims, dims, head, layer, act, feature, features)
+        return WEncoder(input_dims, dims, head, act, downsample, target_length, feature = "waveform")
     elif feature == "pitch":
-        return PEncoder(input_dims, dims, head, layer, act, feature, features)
+        return PEncoder(input_dims, dims, head, act, attend_pitch, feature = "pitch")
     else:
         raise ValueError(f"Unknown feature type: {feature}")
-
-class FEncoder(nn.Module):
-    def __init__(self, mels, input_dims, dims, head, layer, act, feature, features, use_rope=False, spec_shape=None, debug=[]):
-        super().__init__()
-        
-        self.head = head
-        self.head_dim = dims // head  
-        self.dropout = 0.01 
-        self.use_rope = use_rope
-        self.dims = dims
-        self.debug = debug
-        self.feature = feature
-        self.mels = mels
-        self.input_dims = input_dims
-        act_fn = get_activation(act)
-
-        self.encoder = nn.Sequential(
-            Conv1d(mels, dims, kernel_size=3, stride=1, padding=1), act_fn,
-            Conv1d(dims, dims, kernel_size=3, stride=1, padding=1), act_fn,
-            Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
-
-        if use_rope:
-            if spec_shape is not None:
-                self.rope = rotary(dims=dims, head=head, radii=False, debug=[], use_pbias=False, axial=False, spec_shape=spec_shape) # type: ignore
-        else:
-            self.rope = None
-            self.positional = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
-        self.norm = RMSNorm(dims)
-
-    def apply_rope_to_features(self, x, xa=None, mask=None, feats=None, feature="audio", layer="FEncoder"):
-        batch, ctx, dims = x.shape
-        x = x.view(batch, ctx, self.head, self.head_dim).permute(0, 2, 1, 3)
-        freqs = self.rope(ctx, feats=feats, feature=feature, layer=layer)# type: ignore
-        x = self.rope.apply_rotary(x, freqs)# type: ignore
-        x = x.permute(0, 2, 1, 3).contiguous().view(batch, ctx, dims)
-
-        return x
-
-    def forward(self, x, xa=None, mask=None, feats=None, feature="audio", layer="FEncoder"):
-        x = self.encoder(x).permute(0, 2, 1)
-        if self.use_rope:
-            x = self.apply_rope_to_features(x, xa=xa, mask=mask, feats=feats, feature=feature, layer=layer)
-        else:
-            x = x + self.positional(x.shape[1], x.shape[-1], 10000).to(device, dtype)
-        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
-        print(f"feature encoder: {x.shape} {feature}") if "fencoder" in self.debug else None
-        x = self.norm(x)
-        return x
-
-class WEncoder(nn.Module): # waveform encoder
-    def __init__(self, input_dims, dims, head, layer, kernel_size, act, use_rope=False, debug=[], spec_shape=None):
-        super().__init__()
-        
-        self.head = head
-        self.head_dim = dims // head
-        self.dropout = 0.01
-        self.use_rope = use_rope
-        self.dims = dims
-        self.debug = debug
-        act_fn = get_activation(act)
-        self.target_length = None
-        self.encoder = nn.Sequential(
-            Conv1d(input_dims, dims//4, kernel_size=15, stride=4, padding=7), act_fn,
-            Conv1d(dims//4, dims//2, kernel_size=7, stride=2, padding=3), act_fn,
-            Conv1d(dims//2, dims, kernel_size=5, stride=2, padding=2), act_fn)
-            
-        if use_rope:
-            if spec_shape is not None:
-                self.rope = rotary(dims=dims, head=head, radii=False, debug=[], use_pbias=False, axial=False, spec_shape=spec_shape)# type: ignore
-        else:
-            self.rope = None
-            self.positional = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
-        self.norm = RMSNorm(dims)
-
-    def apply_rope_to_features(self, x, xa=None, mask=None, feats=None, feature="waveform", layer="WEncoder"):
-        batch, ctx, dims = x.shape
-        x = x.view(batch, ctx, self.head, self.head_dim).permute(0, 2, 1, 3)
-        freqs = self.rope(ctx, feats=feats, feature=feature, layer=layer)# type: ignore
-        x = self.rope.apply_rotary(x, freqs)# type: ignore
-        x = x.permute(0, 2, 1, 3).contiguous().view(batch, ctx, dims)
-        return x
-        
-    def forward(self, x, xa=None, mask=None, feats= None, feature="waveform", layer = "WEncoder"):
-        x = self.encoder(x).permute(0, 2, 1)  # (batch, time, dims)
-        if self.target_length and x.shape[1] != self.target_length:
-            x = F.adaptive_avg_pool1d(x.transpose(1, 2), self.target_length).transpose(1, 2)
-        if self.use_rope:
-            x = self.apply_rope_to_features(x, xa=xa, mask=mask, feats=feats, feature=feature, layer=layer)
-        else:
-            x = x + self.positional(x.shape[1], x.shape[-1], 10000).to(device, dtype)
-        x = nn.functional.dropout(x, p=self.dropout, training=self.training)
-        print(f"waveform encoder: {x.shape} {feature}") if "fencoder" in self.debug else None
-        return self.norm(x)
-
-class PEncoder(nn.Module): # pitch encoder
-    def __init__(self, input_dims, dims, head, layer, act, use_rope=False, debug=[], one_shot=False, spec_shape=None):
-        super().__init__()
-        
-        self.head = head
-        self.head_dim = dims // head
-        self.dims = dims
-        self.dropout = 0.01
-        self.use_rope = use_rope
-        self.debug = debug
-        act_fn = get_activation(act)
-
-        self.attend_pitch = False
-
-        if self.attend_pitch:
-            self.q, self.k, self.v, self.o, self.scale = qkv_init(dims, head)
-            self.mlp = nn.Sequential(
-                nn.Linear(dims, dims),
-                nn.ReLU(),
-                nn.Linear(dims, dims),
-            )
-        else:
-            self.q, self.k, self.v, self.o, self.scale = None, None, None, None, None
-            self.mlp = None
-
-        self.pitch_encoder = nn.Sequential(
-            Conv1d(input_dims, dims, kernel_size=7, stride=1, padding=3), act_fn,
-            Conv1d(dims, dims, kernel_size=5, stride=1, padding=2), act_fn,
-            Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
-
-        if use_rope:
-                self.rope = rotary(dims=dims, head=head, radii=False, debug=[], use_pbias=False, axial=False, spec_shape=spec_shape)# type: ignore
-        else:
-            self.rope = None
-            self.positional = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)
-        self.norm = RMSNorm(dims)
-        
-    def rope_to_feature(self, x, xa=None, mask=None, feats=None, feature="pitch", layer="PEncoder"):
-        batch, ctx, dims = x.shape
-        x = x.view(batch, ctx, self.head, self.head_dim).permute(0, 2, 1, 3)
-        freqs = self.rope(ctx, feats=feats, feature=feature, layer=layer) # type: ignore
-        x = self.rope.apply_rotary(x, freqs)# type: ignore
-        x = x.permute(0, 2, 1, 3).contiguous().view(batch, ctx, dims)
-        return x
-        
-    def forward(self, x, xa=None, mask=None, feats= None, feature="pitch", layer="PEncoder"):
-        # f0=x
-        # freqs = self.rope(f0.shape[1], feats=feats, feature=feature, layer=layer)
-        if x.dim() == 2:
-            x = x.unsqueeze(0)
-        # if feature == "pitch":
-        x = self.pitch_encoder(x).permute(0, 2, 1)
-
-        if self.use_rope:
-            x = self.rope_to_feature(x, xa=xa, mask=mask, feats=feats, feature=feature, layer=layer)
-    
-        x = x + self.positional(x.shape[1], x.shape[-1], 10000).to(device, dtype)
-        if self.mlp is not None:
-            x = self.mlp(x)
-
-        if self.attend_pitch:
-            if xa is not None:
-                q, k, v = create_qkv(self.q, self.k, self.v, x=xa, xa=x, head=self.head)
-                out, _ = calculate_attention(q, k, v, mask=None, temperature=1.0, is_causal=True)
-                x = x + out
-
-        # x = nn.functional.dropout(x, p=self.dropout, training=self.training)
-        x = self.norm(x)    
-        print(f"Pitch encoder: {x.shape} {feature}") if "fencoder" in self.debug else None
-        return x
 
 @dataclass
 class DataCollator:
     tokenizer: Any
+
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         all_keys = set()
         for f in features:
@@ -1178,8 +2256,9 @@ class DataCollator:
         for key in all_keys:
             if key == "labels":
                 labels_list = [f["labels"] for f in features]
-                max_len = max(len(l) for l in labels_list)  # noqa: E741
+                max_len = max(len(l) for l in labels_list)
                 all_ids, all_labels = [], []
+
                 for label in labels_list:
                     label_list = label.tolist() if isinstance(label, torch.Tensor) else label
                     decoder_input = [bos_token_id] + label_list
@@ -1191,7 +2270,6 @@ class DataCollator:
                     all_ids.append(padded_input)
                     all_labels.append(padded_labels)
                 batch["input_ids"] = torch.tensor(all_ids, dtype=torch.long)
-                # batch["tokens"] = torch.tensor(all_ids, dtype=torch.long)
                 batch["labels"] = torch.tensor(all_labels, dtype=torch.long)
 
             elif key in ["spectrogram", "waveform", "pitch", "harmonic", "aperiodic", "pitch_tokens", "f0", "phase", "crepe_time", "crepe_frequency", "crepe_confidence", "crepe_activation", "dummy"]:
@@ -1209,10 +2287,10 @@ class DataCollator:
                         pad_item = F.pad(item, (0, pad_width), mode='constant', value=pad_token_id)
                     else:
                         pad_item = item
+
                     padded.append(pad_item)
                 batch[key] = torch.stack(padded)
-                # if key == "spectrogram":
-                #     batch["spectrogram"] = batch[key]
+
         return batch
 
 def levenshtein(reference_words, hypothesis_words):
@@ -1243,8 +2321,10 @@ def wer_batch(references, hypotheses):
         total_words += len(ref_words)
     return (total_errors / total_words) * 100 if total_words > 0 else 0.0
 
-def compute_metrics(pred, tokenizer=None, model=None, print_pred=False, num_samples=0):
+def compute_metrics(pred, tokenizer=None, model=None, print_pred=False, num_samples=0, logits=None, compute_result: bool = False):
+    
     def clean(ids, pad_token_id=0, bos_token_id=1, eos_token_id=2):
+        
         if isinstance(ids, torch.Tensor):
             ids = ids.tolist()
         if isinstance(ids[0], (list, torch.Tensor, np.ndarray)):
@@ -1274,9 +2354,8 @@ def compute_metrics(pred, tokenizer=None, model=None, print_pred=False, num_samp
             print(f"Pred: '{pred_str[i]}'")
             print(f"Label: '{label_str[i]}'")
             print("-" * 40)
-            
+
     wer = wer_batch(label_str, pred_str)
-  
     if model is not None:
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000
         efficiency_score = (100 - wer) / trainable_params if trainable_params > 0 else 0.0
@@ -1343,1061 +2422,227 @@ def process_spectrogram_with_hilbert(spec):
     envelope = torch.abs(analytic)
     phase = torch.angle(analytic)
     return envelope, phase
-  
-class ProjectionModule(nn.Module):
-    def __init__(self, dims: int, head: int, proj_type: str = "query", use_bias: bool = True):
+
+class MyModel(nn.Module):
+    def __init__(self, num_layers, dims, head, act_fn):
         super().__init__()
-        assert dims % head == 0, f"dims ({dims}) must be divisible by head ({head})"
-        assert proj_type in ["query", "key", "value"], \
-               f"proj_type must be 'query', 'key', or 'value', got {proj_type}"
+        self.num_layers = num_layers 
 
-        self.dims = dims
+        self.layers = nn.ModuleList()
+        for i in range(num_layers):
+            layer_dict = {
+                'ln': nn.LayerNorm(dims),
+                'gate': nn.Sequential(nn.Linear(dims, 1), nn.Sigmoid()),
+                'adapter': nn.Linear(dims, dims) if i % 2 == 0 else None,
+                "res1": residual(dims, head, num_layers, act_fn),
+                "res2": residual(dims, head, num_layers, act_fn),
+                "res3": residual(dims, head, num_layers, act_fn),      
+            }
+            if i == 5:
+                layer_dict['special_attention'] = attentiona(dims, head)
+            self.layers.append(nn.ModuleDict(layer_dict))
+        
+    def forward(self, x, xa, enc=None, sequential=False, modal=False, blend=False, kv_cache=None) -> torch.Tensor:    
+   
+        if self.num_layers > 0:
+            cur_dict = self.layers[0]
+            xa = cur_dict['res1'](xa)
+
+        if self.num_layers > 1:
+            cur_dict = self.layers[1]
+            a = cur_dict['res2'](x)
+
+        if self.num_layers > 2:
+            cur_dict = self.layers[2]
+            b = cur_dict['res3'](x, xa, None)
+
+        if self.num_layers > 3:
+            cur_dict = self.layers[3]
+            xm = cur_dict['res1'](torch.cat([x, xa], dim=1))
+
+        if self.num_layers > 4:
+            cur_dict = self.layers[4]
+            c = cur_dict['res2'](xm[:, :x.shape], xm[:, x.shape:], mask=None)
+
+        if self.num_layers > 5:
+            cur_dict = self.layers[5]
+
+            x = cur_dict['res3'](a + b + c) 
+            
+            x = cur_dict['res3'](x, xa, None)
+
+            x = cur_dict['lna'](x)
+
+            if 'special_attention' in cur_dict:
+                special_attn_output = cur_dict['special_attention'](x, xa=x, mask=None)
+                x = x + special_attn_output
+
+            aux_attn_output = self.attention_auxiliary(x, xa=x, mask=None)
+            x = x + aux_attn_output
+
+        for i in range(6, self.num_layers):
+            cur_dict = self.layers[i]
+            x = cur_dict['res1'](x)
+            x = cur_dict['lna'](x)
+
+        return x
+
+class attention_a(nn.Module):
+    def __init__(self, dims: int, head: int, layer):
+        super().__init__()
         self.head = head
+        self.dims = dims
         self.head_dim = dims // head
-        self.proj_type = proj_type
-        self.scale = self.head_dim ** -0.5 if proj_type != "value" else 1.0
-        self.proj = Linear(in_features=dims, out_features=dims, bias=use_bias)
-        self.init_weights()
 
-    def init_weights(self):
-        nn.init.normal_(tensor=self.proj.weight, std=0.02)
-        if self.proj.bias is not None:
-            nn.init.zeros_(tensor=self.proj.bias)
+        self.q = nn.Linear(dims, dims) 
+        self.kv = nn.Linear(dims, dims * 2, bias=False)
+        self.out = nn.Linear(dims, dims)
+        self.lna = nn.LayerNorm(dims) 
+        self.lnb = nn.LayerNorm(dims // head) 
 
-    def forward(self, x: Tensor) -> Tensor:
-        batch, seq_len, _ = x.shape
-        proj = self.proj(x)
-        proj = proj.view(batch, seq_len, self.head, self.head_dim).permute(0, 2, 1, 3)
-        if self.proj_type in ["query", "key"]:
-            proj = proj * self.scale
-        return proj
-      
-def calculate_attentionc(q, k, v, mask = None,
-    temperature: float = 1.0,
-    use_sdpa: bool = True,
-    is_causal: bool = False,
-    dropout_p: float = 0.0
-) -> Tuple[Tensor, Optional[Tensor]]:
+    def forward(self, x, xa = None, mask = None):
+        q = self.q(x)
+        k, v = self.kv(self.lna(x if xa is None else xa)).chunk(2, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b c (h d) -> b h c d', h = self.head), (q, k, v))
+        a = scaled_dot_product_attention(self.lnc(q), self.lnd(k), v, is_causal=mask is not None and q.shape[2] > 1)
+        wv = a.permute(0, 2, 1, 3).flatten(start_dim=2)
+        out = self.out(wv)
+        return out
 
-    batch_size, num_heads, q_len, head_dim = q.shape
-    k_len = k.size(2)
-    temp_scale = 1.0 / temperature if temperature > 0 else 1.0
-    attn_output, attn_weights = None, None
-    if use_sdpa:
-        try:
-            if temperature != 1.0:
-                 raise NotImplementedError("SDPA does not directly support temperature scaling. Use manual path or scale Q.")
+class attentio0(nn.Module):
+    def __init__(self, dims: int, head: int, layer):
+        super().__init__()
+        self.head = head
+        self.dims = dims
+        self.head_dim = dims // head
 
-            attn_output = scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=mask,
-                dropout_p=dropout_p,
-                is_causal=is_causal and mask is None
-            )
-            attn_weights = None
-            return attn_output, attn_weights
-        except (RuntimeError, NotImplementedError) as e:
-            log.warning(f"SDPA failed or not used ({e}), falling back to manual attention.")
-    attn_scores = torch.matmul(q, k.transpose(-2, -1)) * temp_scale
+        self.pad_token = 0
+        self.zmin = 1e-6
+        self.zmax = 1e-5     
+        self.zero = nn.Parameter(torch.tensor(1e-4, device=device, dtype=dtype), requires_grad=False)
+        self.taylor_expand_fn = partial(second_taylor)
+        self.q = nn.Linear(dims, dims) 
+        self.kv = nn.Linear(dims, dims * 2, bias=False)
+        self.out = nn.Linear(dims, dims)
+
+        self.lna = nn.LayerNorm(dims) 
+        self.lnb = nn.LayerNorm(dims // head) 
+
+    def forward(self, x, xa = None, mask = None,  positions = None):
+
+        q = self.q(x)
+        k, v = self.kv(self.lna(x if xa is None else xa)).chunk(2, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b c (h d) -> b h c d', h = self.head), (q, k, v))
+        scale = q.shape[-1] ** -0.5
+
+        qk = einsum('b h k d, b h q d -> b h k q', self.lnb(q), self.lnb(k)) * scale 
+
+        if mask is not None:
+            mask=mask[:q.shape[2], :q.shape[2]]
+
+        token_ids = k[:, :, :, 0]
+        zscale = torch.ones_like(token_ids)
+        fzero = torch.clamp(F.softplus(self.fzero), self.minz, self.maxz)
+        zscale[token_ids.float() == self.pad_token] = fzero
+        
+        if xa is not None:
+            qk = qk + mask * zscale.unsqueeze(-2).expand(qk.shape)
+
+        qk = qk * zscale.unsqueeze(-2)
+        qk = taylor_softmax(qk, order=2)
+        wv = einsum('b h k q, b h q d -> b h k d', qk, v) 
+        wv = rearrange(wv, 'b h c d -> b c (h d)')
+        out = self.out(wv)
+        return out
+
+class attentio0b(nn.Module):
+    def __init__(self, dims: int, head: int, layer):
+        super().__init__()
+        self.head = head
+        self.dims = dims
+        self.head_dim = dims // head
+
+        self.pad_token = 0
+        self.zmin = 1e-6
+        self.zmax = 1e-5     
+        self.zero = nn.Parameter(torch.tensor(1e-4, device=device, dtype=dtype), requires_grad=False)
+        self.taylor_expand_fn = partial(second_taylor)
+        self.q = nn.Linear(dims, dims) 
+        self.kv = nn.Linear(dims, dims * 2, bias=False)
+        self.out = nn.Linear(dims, dims)
+
+        self.lna = nn.LayerNorm(dims) 
+        self.lnb = nn.LayerNorm(dims // head) 
+
+    def forward(self, x, xa = None, mask = None,  positions = None):
+
+        q = self.q(x)
+        k, v = self.kv(self.lna(x if xa is None else xa)).chunk(2, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b c (h d) -> b h c d', h = self.head), (q, k, v))
+        scale = q.shape[-1] ** -0.5
+
+        qk = einsum('b h k d, b h q d -> b h k q', self.lnb(q), self.lnb(k)) * scale 
+
+        if mask is not None:
+            mask=mask[:q.shape[2], :q.shape[2]]
+
+        token_ids = k[:, :, :, 0]
+        zscale = torch.ones_like(token_ids)
+        fzero = torch.clamp(F.softplus(self.fzero), self.minz, self.maxz)
+        zscale[token_ids.float() == self.pad_token] = fzero
+        
+        if xa is not None:
+            qk = qk + mask * zscale.unsqueeze(-2).expand(qk.shape)
+
+        qk = qk * zscale.unsqueeze(-2)
+        qk = F.softmax(qk, dim=-1)
+        wv = einsum('b h k q, b h q d -> b h k d', qk, v) 
+        wv = rearrange(wv, 'b h c d -> b c (h d)')
+        out = self.out(wv)
+        return out
+
+class attention(nn.Module):
+    def __init__(self, dims: int, head: int, layer):
+        super().__init__()
+        self.head = head
+        self.dims = dims
+        self.head_dim = dims // head
+
+        self.pad_token = 0
+        self.zmin = 1e-6
+        self.zmax = 1e-5     
+        self.zero = nn.Parameter(torch.tensor(1e-4, device=device, dtype=dtype), requires_grad=False)
+        self.taylor_expand_fn = partial(second_taylor)
+        self.q = nn.Linear(dims, dims) 
+        self.kv = nn.Linear(dims, dims * 2, bias=False)
+        self.out = nn.Linear(dims, dims)
+
+        self.lna = nn.LayerNorm(dims) 
+        self.lnb = nn.LayerNorm(dims // head) 
+
+def forward_revised(self, x, xa = None, mask = None):
+    q = self.q(x)
+    k, v = self.kv(self.lna(x if xa is None else xa)).chunk(2, dim=-1)
+    q, k, v = map(lambda t: rearrange(t, 'b c (h d) -> b h c d', h = self.head), (q, k, v))
+
+    q_expanded = second_taylor(q)
+    k_expanded = second_taylor(k)
+    dk_expanded = k_expanded.shape[-1]
+    scale_factor = dk_expanded ** -0.5
+    qk_logits = torch.einsum('b h k d, b h q d -> b h k q', self.lnb(q_expanded), self.lnb(k_expanded)) * scale_factor
 
     if mask is not None:
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0).unsqueeze(0)
-        elif mask.dim() == 3:
-            mask = mask.unsqueeze(1)
+        seq_len_q, seq_len_k = qk_logits.shape[-2:]
+        causal_mask = torch.ones(seq_len_q, seq_len_k, device = qk_logits.device, dtype = torch.bool).triu(seq_len_k - seq_len_q + 1)
+        qk_logits = qk_logits.masked_fill(causal_mask, -torch.finfo(qk_logits.dtype).max)
 
-        expected_mask_shape = (batch_size, num_heads, q_len, k_len)
-        if mask.shape != expected_mask_shape:
-             try:
-                 mask = mask.expand(expected_mask_shape)
-             except RuntimeError:
-                 raise ValueError(f"Mask shape {mask.shape} is not compatible with attention scores shape {expected_mask_shape}")
-        if mask.dtype == torch.bool:
-            attn_scores = attn_scores.masked_fill(mask, float("-inf"))
-        else:
-            attn_scores = attn_scores + mask
-    attn_weights = F.softmax(attn_scores, dim=-1)
-    if dropout_p > 0.0:
-        attn_weights = F.dropout(attn_weights, p=dropout_p)
-    attn_output = torch.matmul(attn_weights, v)
-    return attn_output, attn_weights
+    qk_weights = taylor_softmax(qk_logits, order=2)
+    wv = torch.einsum('b h k q, b h q d -> b h k d', qk_weights, v)
+    wv = rearrange(wv, 'b h c d -> b c (h d)')
+    out = self.out(wv)
+    return out
 
-class BaseAttention(nn.Module):
-    """Base class for attention mechanisms with common functionality."""
-    use_sdpa = True
 
-    def __init__(self, dims: int, head: int, max_dist: int = 512, dropout: float = 0.0):
-        super().__init__()
-        assert dims % head == 0, f"dims ({dims}) must be divisible by head ({head})"
-        self.dims = dims
-        self.head = head
-        self.head_dim = dims // head
-        self.max_dist = max_dist
-        self.dropout = dropout
 
-    def _shape(self, tensor: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, _ = tensor.shape
-        return tensor.view(batch, seq_len, self.head, self.head_dim).transpose(1, 2).contiguous()
 
-    def _reshape_to_output(self, attn_output: Tensor) -> Tensor:
-        batch, _, seq_len, _ = attn_output.shape
-        return attn_output.transpose(1, 2).contiguous().view(batch, seq_len, self.dims)
-
-class AttentionCombiner(BaseAttention):
-    """ Note, assumes Q, K, V inputs are already projected and appropriately shaped/scaled. """
-    def __init__(self, dims: int, head: int, use_bias: bool = True, dropout: float = 0.0):
-        super().__init__(dims, head, dropout=dropout)
-        self.out = Linear(in_features=dims, out_features=dims, bias=use_bias)
-        self._init_weights()
-
-    def _init_weights(self):
-
-        nn.init.normal_(tensor=self.out.weight, std=0.02)
-        if self.out.bias is not None:
-            nn.init.zeros_(tensor=self.out.bias)
-
-    # @autocast('cuda', enabled=torch.cuda.is_available())
-    def forward(self, q: Tensor, k: Tensor, v: Tensor,
-                mask: Optional[Tensor] = None, is_causal: bool = False) -> Tensor:
-                  
-        attn_output, _ = calculate_attention(
-            q, k, v, mask=mask,
-            temperature=1.0,
-            use_sdpa=BaseAttention.use_sdpa,
-            is_causal=is_causal,
-            dropout_p = self.dropout
-        )
-
-        output = self._reshape_to_output(attn_output)
-        return self.out(output)
-
-class AdaptiveUpdateAttention(BaseAttention):
-    """
-    Note: Current implementation focuses on conditional update based on *current*
-    input, not standard auto-regressive KV caching for generation.
-    """
-    def __init__(self, dims: int, head: int, max_dist: int = 512, update_threshold: float = 0.5, dropout: float = 0.0):
-        super().__init__(dims, head, max_dist, dropout=dropout)
-        self.query_module = ProjectionModule(dims, head, "query")
-        self.key_module = ProjectionModule(dims, head, "key")
-        self.value_module = ProjectionModule(dims, head, "value")
-        self.combiner = AttentionCombiner(dims, head, dropout=dropout)
-
-        self.key_update_predictor = nn.Sequential(
-            Linear(dims, dims // 4), nn.ReLU(), Linear(dims // 4, 1), nn.Sigmoid())
-        self.value_update_predictor = nn.Sequential(
-            Linear(dims, dims // 4), nn.ReLU(), Linear(dims // 4, 1), nn.Sigmoid())
-
-        self.update_threshold = update_threshold
-        self.stored_key_cache: Optional[Tensor] = None
-        self.stored_value_cache: Optional[Tensor] = None
-        self.reset_cache_on_forward = True
-
-    def _should_update(self, x: torch.Tensor, predictor: nn.Module) -> torch.Tensor:
-        avg_rep = x.mean(dim=1)
-        update_prob = predictor(avg_rep)
-        return update_prob > self.update_threshold
-
-    def forward(self, x: Tensor, xa: Optional[Tensor] = None,
-                mask: Optional[Tensor] = None,
-                is_causal: bool = False) -> Tensor:
-                  
-        if self.reset_cache_on_forward:
-             self.stored_key_cache = None
-             self.stored_value_cache = None
-
-        batch, ctx_q, _ = x.shape
-        q = self.query_module(x)
-
-        kv_input = xa if xa is not None else x
-        ctx_kv = kv_input.size(1)
-
-        update_k_batch = self._should_update(kv_input, self.key_update_predictor)
-        update_v_batch = self._should_update(kv_input, self.value_update_predictor)
-
-        if self.stored_key_cache is None or self.stored_key_cache.shape[2] != ctx_kv or self.stored_key_cache.shape[0] != batch:
-            k = self.key_module(kv_input)
-            self.stored_key_cache = k
-        elif update_k_batch.any():
-            new_k = self.key_module(kv_input)
-            update_mask_k = update_k_batch.view(-1, 1, 1, 1).expand_as(self.stored_key_cache)
-            k = torch.where(update_mask_k, new_k, self.stored_key_cache)
-            self.stored_key_cache = k
-        else:
-            k = self.stored_key_cache
-
-        if self.stored_value_cache is None or self.stored_value_cache.shape[2] != ctx_kv or self.stored_value_cache.shape[0] != batch:
-            v = self.value_module(kv_input)
-            self.stored_value_cache = v
-        elif update_v_batch.any():
-            new_v = self.value_module(kv_input)
-            update_mask_v = update_v_batch.view(-1, 1, 1, 1).expand_as(self.stored_value_cache)
-            v = torch.where(update_mask_v, new_v, self.stored_value_cache)
-            self.stored_value_cache = v
-        else:
-            v = self.stored_value_cache
-
-        output = self.combiner(q, k, v, mask=mask, is_causal=is_causal)
-        return output
-
-class QRefiner:
-    def __init__(self, states: int, actions: int, alpha: float = 0.1, gamma: float = 0.9, epsilon: float = 0.1):
-        self.states = states
-        self.actions = actions
-        self.R = {}
-        self.alpha = alpha
-        self.gamma = gamma
-        self.epsilon = epsilon
-        self.default_value = 0.0
-
-    def get_value(self, state: int, action: int) -> float:
-        return self.R.get((state, action), self.default_value)
-
-    def set_value(self, state: int, action: int, value: float):"
-        self.R[(state, action)] = value
-
-    def choose_action(self, state: int) -> int:
-        if np.random.random() < self.epsilon:
-            return np.random.randint(self.actions)
-        else:
-            action_values = [self.get_value(state, a) for a in range(self.actions)]
-            return np.argmax(action_values).item()
-
-    def update(self, state: int, action: int, reward: float, next_state: int):
-        next_values = [self.get_value(next_state, a) for a in range(self.actions)]
-        best_next_value = max(next_values) if next_values else self.default_value
-
-        old_value = self.get_value(state, action)
-        td_target = reward + self.gamma * best_next_value
-        td_error = td_target - old_value
-        new_value = old_value + self.alpha * td_error
-        self.set_value(state, action, new_value)
-
-class Predictor(nn.Module):
-    """Note., this version for adaptive span)."""
-    def __init__(self, dims: int):
-        super().__init__()
-        self.linear = Linear(in_features=dims, out_features=1)
-        self._init_weights()
-
-    def _init_weights(self):
-        """Initialize predictor weights."""
-        nn.init.xavier_normal_(self.linear.weight)
-        if self.linear.bias is not None:
-           nn.init.zeros_(self.linear.bias)
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Predicts a scale factor (0-1) from input features.
-
-        Args:
-            x: Input tensor (Batch, SeqLen, Dims) or (Batch, Dims).
-
-        Returns:
-            Scale tensor (Batch, 1).
-        """
-        if x.dim() > 2:
-            x = x.mean(dim=1)
-        scale = torch.sigmoid(self.linear(x))
-        return scale
-
-class AdaptiveSpanAttention(BaseAttention):
-    """
-    Note: This implementation attends only to the *first* `eff_span` tokens.
-    For attending to a *relative* window, different logic (e.g., sliding window
-    or masking) would be needed in `calculate_attentionc`.
-    """
-    def __init__(self, dims: int, head: int, max_dist: int = 512,
-                 initial_span_scale: float = 1.0, learnable_scale: bool = True,
-                 sharpen: bool = True, temp_scale: float = 0.01, dropout: float = 0.0):
-
-        super().__init__(dims, head, max_dist, dropout=dropout)
-        self.sharpen = sharpen
-        self.temp_scale = temp_scale
-        if learnable_scale:
-            self.span_scale = nn.Parameter(torch.tensor(initial_span_scale))
-        else:
-            self.register_buffer("span_scale", torch.tensor(initial_span_scale))
-
-        self.query_module = ProjectionModule(dims, head, "query")
-        self.key_module = ProjectionModule(dims, head, "key")
-        self.value_module = ProjectionModule(dims, head, "value")
-        self.out_proj = Linear(dims, dims)
-
-    @autocast('cuda', enabled=torch.cuda.is_available())
-    def forward(self, x: Tensor, xa: Optional[Tensor] = None,
-                mask: Optional[Tensor] = None,
-                span_scale_override: Optional[Tensor] = None,
-                is_causal: bool = False) -> Tuple[Tensor, Optional[Tensor]]:
-        kv_input = xa if xa is not None else x
-        batch, ctx_q, _ = x.shape
-        ctx_kv = kv_input.size(1)
-
-        current_span_scale = span_scale_override if span_scale_override is not None else self.span_scale
-        if isinstance(current_span_scale, nn.Parameter):
-             span_scale_val = current_span_scale.sigmoid()
-        elif current_span_scale.numel() == 1:
-             span_scale_val = current_span_scale.expand(batch, 1)
-        else:
-             span_scale_val = current_span_scale
-
-        span_mean = span_scale_val.mean().item()
-        max_span_len = ctx_kv
-        target_span_len = max(1, int(max_span_len * span_mean))
-
-        eff_span = min(target_span_len, self.max_dist, ctx_q, ctx_kv)
-
-        if eff_span == 0:
-            return (torch.zeros_like(x), None)
-
-        q_span = x[:, :eff_span, :]
-        k_span = kv_input[:, :eff_span, :]
-        v_span = kv_input[:, :eff_span, :]
-
-        q_proj = self.query_module(q_span)
-        k_proj = self.key_module(k_span)
-        v_proj = self.value_module(v_span)
-
-        temperature = (1.0 + self.temp_scale * (1.0 - span_mean)
-                       if self.sharpen
-                       else 0.5 + self.temp_scale * span_mean)
-        temperature = max(temperature, 1e-3)
-
-        span_mask = None
-        if mask is not None:
-             if mask.dim() == 4:
-                 span_mask = mask[:, :, :eff_span, :eff_span]
-             elif mask.dim() == 2:
-                 span_mask = mask[:eff_span, :eff_span]
-        attn_output_span, attn_weights = calculate_attention(
-            q_proj, k_proj, v_proj,
-            mask=span_mask,
-            temperature=temperature,
-            use_sdpa=BaseAttention.use_sdpa,
-            is_causal=is_causal,
-            dropout_p=self.dropout
-        )
-
-        output_span = self._reshape_to_output(attn_output_span)
-        projected_output_span = self.out_proj(output_span)
-
-        output = torch.zeros_like(x)
-        output[:, :eff_span, :] = projected_output_span
-
-        return output, attn_weights
-
-class MyelinatedLayer(BaseAttention):
-    """ (This version assumes IntegratedAttention is the core attention mechanism). """
-    def __init__(self, dims: int, head: int, num_layers: int = 3,
-                 sparsity_threshold: float = 0.1, max_dist: int = 512,
-                 dropout: float = 0.1, mlp_ratio: int = 4):
-        super().__init__(dims, head, max_dist, dropout)
-        self.num_layers = num_layers
-        self.sparsity_threshold = sparsity_threshold
-
-        self.attention = IntegratedAttention(dims, head, max_dist=max_dist, dropout=dropout)
-
-        self.sub_layers = nn.ModuleList()
-        self.node_predictors = nn.ModuleList([
-            nn.Sequential(LayerNorm(dims), Linear(dims, 1), nn.Sigmoid())
-            for _ in range(num_layers)])
-
-        for i in range(num_layers):
-            self.sub_layers.append(nn.ModuleDict({
-                'ln': LayerNorm(dims),
-                'gate': nn.Sequential(Linear(dims, 1), nn.Sigmoid()),
-                'adapter': Linear(dims, dims) if i % 2 == 0 else None
-            }))
-
-        self.policy_net = nn.Sequential(Linear(dims, 128), nn.ReLU(), Linear(128, num_layers))
-        self.jump_weights = nn.Parameter(torch.tensor([0.1, 0.05, 0.01]))
-
-        n_mlp = dims * mlp_ratio
-        self.mlp_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
-        self.mlp = nn.Sequential(Linear(dims, n_mlp), nn.GELU(), Linear(n_mlp, dims), nn.Dropout(dropout))
-        self.mlp_ln = LayerNorm(dims)
-
-        self.working_memory = nn.Parameter(torch.zeros(1, 1, dims))
-        self.memory_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
-
-        self.last_memory_gate_values: Optional[Tensor] = None
-
-    def predict_node_importance(self, x: Tensor, layer_idx: int) -> Tensor:
-        """Predict token importance mask (0.0 or 1.0) for sparsity."""
-        importance = self.node_predictors[layer_idx](x)
-        is_important = (importance > self.sparsity_threshold).float()
-        return is_important
-
-    def forward(self, x: Tensor, xa: Optional[Tensor] = None,
-                mask: Optional[Tensor] = None, kv_cache: Optional[Tensor] = None,
-                is_causal: bool = True) -> Tensor:
-        batch, ctx, _ = x.shape
-        working_memory = self.working_memory.expand(batch, 1, -1).to(x.device)
-        original_x = x
-
-        pooled_representation = x.mean(dim=1)
-        policy_logits = self.policy_net(pooled_representation)
-        policy = F.softmax(policy_logits, dim=-1)
-
-        jump_history = []
-        i = 0
-        last_processed_output = x
-
-        while i < self.num_layers:
-            layer = self.sub_layers[i]
-
-            node_importance_mask = self.predict_node_importance(x, i)
-
-            if node_importance_mask.mean() < 0.2 and i > 0:
-                i += 1
-                jump_history.append(f"skip_low_imp->{i}")
-                continue
-
-            norm_x = layer['ln'](x)
-
-            current_attn_mask = node_importance_mask.permute(0, 2, 1)
-            if mask is not None:
-                 pass
-
-            attn_output = self.attention(
-                norm_x * node_importance_mask,
-                xa=xa,
-                mask=mask,
-                kv_cache=kv_cache,
-                is_causal=is_causal
-            )
-
-            if layer['adapter'] is not None:
-                attn_output = layer['adapter'](attn_output)
-
-            gate_value = layer['gate'](norm_x)
-            x = x + gate_value * attn_output * node_importance_mask
-            last_processed_output = x
-
-            memory_gate = self.memory_gate(x.mean(dim=1, keepdim=True))
-            current_mean_x = x.mean(dim=1, keepdim=True)
-            working_memory = memory_gate * working_memory + (1 - memory_gate) * current_mean_x
-
-            if i < self.num_layers - 1:
-                 jump_prob_dist = policy[:, 1:]
-                 jump_prob = jump_prob_dist.sum(dim=-1)
-
-                 should_jump_batch = torch.rand_like(jump_prob) < jump_prob
-
-                 if should_jump_batch.any():
-                     jump_len_probs = policy[should_jump_batch, :self.num_layers-i]
-                     sampled_jump_len = torch.multinomial(jump_len_probs, 1)[:, 0] + 1
-
-                     jump_length = sampled_jump_len.max().item()
-                     i_next = min(i + jump_length, self.num_layers)
-
-                     skip_weight_idx = min(jump_length - 1, len(self.jump_weights) - 1)
-                     skip_weight = self.jump_weights[skip_weight_idx]
-
-                     x = skip_weight * original_x + (1 - skip_weight) * working_memory.expand_as(x) + x * (1-skip_weight)
-                     jump_history.append(f"jump_{jump_length} S:{skip_weight.item():.2f} ->{i_next}")
-                     i = i_next
-                     continue
-
-            i += 1
-
-        mlp_input = last_processed_output
-        norm_mlp_input = self.mlp_ln(mlp_input)
-        mlp_output = self.mlp(norm_mlp_input)
-        mlp_gate_value = self.mlp_gate(norm_mlp_input)
-        final_output = mlp_input + mlp_gate_value * mlp_output
-
-        if 'memory_gate' in locals():
-             self.last_memory_gate_values = memory_gate.detach().clone()
-
-        return final_output
-
-def _calculate_rl_reward(self, output: Tensor) -> float:
-    with torch.no_grad():
-        output_probs = torch.softmax(output, dim=-1)
-        safe_probs = torch.clamp(output_probs, min=1e-10)
-        entropy = -(safe_probs * torch.log(safe_probs)).sum(-1).mean()
-        coverage = (output.abs() > 0.01).float().mean()
-        reward = float(coverage - 0.1 * entropy)
-    return reward
-
-def _extract_rl_state(self, x: Tensor) -> int:
-    with torch.no_grad():
-        pooled = x.mean(dim=1)
-        mean_state = pooled[0].mean()
-        var_state = pooled[0].var(unbiased=False)
-        state_features = torch.stack([mean_state, var_state]).cpu().numpy()
-        state_id = self._discretize_state(state_features)
-    return state_id
-
-def _discretize_state(self, state: np.ndarray) -> int:
-    bins = np.linspace(-1, 1, num=10)
-    state_discrete = np.digitize(state, bins)
-    state_hash = sum(val * (10**i) for i, val in enumerate(state_discrete))
-    state_id = int(state_hash % self.refiner.states)
-    return state_id
-
-def _action_to_scale(self, action: int) -> Tensor:
-    span_value = action / (self.refiner.actions - 1)
-    scale_tensor = torch.tensor([span_value], device=self.span_pred.linear.weight.device, dtype=torch.float)
-    return scale_tensor
-
-class CTCDecoder(nn.Module):
-    def __init__(self, input_dim: int, vocab_size: int, dims: int = 256, num_layers: int = 2, dropout: float = 0.1):
-        super().__init__()
-        self.input_dim = input_dim
-        self.vocab_size = vocab_size
-        self.dims = dims
-        
-        self.projection = nn.Linear(input_dim, dims)
-        self.lstm = nn.LSTM(dims, dims, num_layers, dropout=dropout if num_layers > 1 else 0, batch_first=True, bidirectional=True)
-        self.output = nn.Linear(dims * 2, vocab_size + 1)  # +1 for CTC blank token
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.projection(x)  # (batch, seq_len, dims)
-        x = self.dropout(x)
-        x, _ = self.lstm(x)  # (batch, seq_len, dims * 2)
-        x = self.dropout(x)
-        logits = self.output(x)  # (batch, seq_len, vocab_size + 1)
-        return logits
-
-class CTCWrapper(nn.Module):
-    def __init__(self, model: Model, vocab_size: int, dims: int = 256, num_layers: int = 2):
-        super().__init__()
-        self.model = model
-        self.ctc_decoder = CTCDecoder(
-            input_dim=model.param.dims,
-            vocab_size=vocab_size,
-            dims=dims,
-            num_layers=num_layers
-        )
-        
-    def forward(self, input_ids=None, pitch=None, labels=None, input_lengths=None, label_lengths=None):
-        outputs = self.model(input_ids=input_ids, pitch=pitch)
-        x = outputs["logits"]  # (batch, seq_len, vocab_size)
-        ctc_logits = self.ctc_decoder(x)  # (batch, seq_len, vocab_size + 1)
-        loss = None
-        if labels is not None and input_lengths is not None and label_lengths is not None:
-            log_probs = torch.log_softmax(ctc_logits, dim=-1)
-            log_probs = log_probs.transpose(0, 1)
-            
-            loss = torch.nn.functional.ctc_loss(
-                log_probs,
-                labels,
-                input_lengths,
-                label_lengths,
-                blank=0,
-                reduction='mean'
-            )
-        
-        return {
-            "logits": ctc_logits,
-            "loss": loss,
-            "out": x
-        }
-    
-    def decode(self, logits: Tensor, input_lengths: Optional[Tensor] = None) -> List[List[int]]:
-        probs = torch.softmax(logits, dim=-1)  # (batch, seq_len, vocab_size + 1)
-        predictions = torch.argmax(probs, dim=-1)  # (batch, seq_len)
-        
-        decoded_sequences = []
-        for i, pred in enumerate(predictions):
-            seq = []
-            prev_token = None
-            for j, token in enumerate(pred):
-                if input_lengths is not None and j >= input_lengths[i]:
-                    break
-                if token != 0 and token != prev_token:
-                    seq.append(token.item())
-                prev_token = token
-            decoded_sequences.append(seq)
-        return decoded_sequences
-
-    # ctc_model = CTCWrapper(model, vocab_size=40000, dims=256, num_layers=2)
-    # outputs = ctc_model(
-    #     input_ids=input_ids,
-    #     pitch=pitch,
-    #     labels=labels,
-    #     input_lengths=input_lengths,  # Length of each audio sequence
-    #     label_lengths=label_lengths   # Length of each text sequence
-    # )
-    # loss = outputs["loss"]
-    # outputs = ctc_model(input_ids=input_ids, pitch=pitch)
-    # logits = outputs["logits"]
-    # decoded_sequences = ctc_model.decode(logits, input_lengths=input_lengths)
-    # ctc_model = CTCWrapper(model, vocab_size=param.vocab, dims=256, num_layers=2).to('cuda')
-    # print(f"CTC model parameters: {sum(p.numel() for p in ctc_model.parameters() if p.requires_grad):,}")
-
-def compute_metricsB(pred, tokenizer):
-    pred_ids = pred["predictions"]
-    label_ids = pred["label_ids"]
-    if isinstance(pred_ids, tuple):
-        pred_ids = pred_ids[0]
-    else:
-        pred_ids = pred_ids
-    if pred_ids.ndim == 3:
-        pred_ids = np.argmax(pred_ids, axis=-1)
-    label_ids[label_ids == -100] = tokenizer.pad_token_id
-    pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-    label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-    metrics = evaluate.load(path="wer")
-    wer = metrics.compute(predictions=pred_str, references=label_str)
-    return {"wer": wer}
-
-def train_and_evaluate(
-    model,
-    tokenizer,
-    train_loader,
-    eval_loader,
-    optimizer,
-    scheduler,
-    loss_fn,
-    max_steps=10000,
-    device="cuda",
-    accumulation_steps=1,
-    clear_cache=True,
-    log_interval=10,
-    eval_interval=100,
-    save_interval=1000,
-    checkpoint_dir="checkpoint_dir",
-    log_dir="log_dir",
-):
-    model.to(device)
-    global_step = 0
-    scaler = torch.GradScaler()
-    writer = SummaryWriter(log_dir=log_dir)
-    train_iterator = iter(train_loader)
-    total_loss = 0
-    step_in_report = 0
-    dataset_epochs = 0
-
-    progress_bar = tqdm(
-        total=max_steps, desc="Training Progress", leave=True, colour="green"
-    )
-
-    model.train()
-    optimizer.zero_grad()
-
-    while global_step < max_steps:
-        try:
-            batch = next(train_iterator)
-        except StopIteration:
-            train_iterator = iter(train_loader)
-            batch = next(train_iterator)
-            dataset_epochs += 1
-            print(f"Starting dataset epoch {dataset_epochs}")
-
-            if step_in_report > 0:
-                avg_loss = total_loss / step_in_report
-                logging.info(
-                    f"Dataset iteration complete - Steps: {global_step}, Avg Loss: {avg_loss:.4f}"
-                )
-                total_loss = 0
-                step_in_report = 0
-
-        start_time = time.time()
-
-        input_features = batch["input_features"].to(device)
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].long().to(device)
-
-        with torch.autocast(device_type="cuda"):
-            input_features_encoded = model.encoder(input_features)
-            decoder_output = model.decoder(input_ids, input_features_encoded)
-            logits = decoder_output.view(-1, decoder_output.size(-1))
-            active_logits = logits.view(-1, decoder_output.size(-1))
-            active_labels = labels.view(-1)
-            active_mask = active_labels != -100
-            active_logits = active_logits[active_mask]
-            active_labels = active_labels[active_mask]
-            loss = loss_fn(active_logits, active_labels)
-            # model.adjust_freq(loss=loss.item())
-        total_loss += loss.item()
-        loss = loss / accumulation_steps
-
-        scaler.scale(loss).backward()
-
-        if (global_step + 1) % accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-
-            if clear_cache:
-                torch.cuda.empty_cache()
-
-        end_time = time.time()
-        samples_per_sec = len(batch["input_features"]) / (end_time - start_time)
-
-        if global_step % log_interval == 0:
-            writer.add_scalar(
-                tag="Loss/train",
-                scalar_value=total_loss / (global_step + 1),
-                global_step=global_step,
-            )
-            lr = scheduler.get_last_lr()[0]
-            writer.add_scalar(
-                tag="LearningRate", scalar_value=lr, global_step=global_step
-            )
-            writer.add_scalar(
-                tag="SamplesPerSec",
-                scalar_value=samples_per_sec,
-                global_step=global_step,
-            )
-
-        if global_step % eval_interval == 0:
-            model.eval()
-            eval_start_time = time.time()
-            eval_loss = 0
-            all_predictions = []
-            all_labels = []
-            batch_count = 0
-            total_samples = 0
-
-            with torch.no_grad():
-                for eval_batch in eval_loader:
-                    # for eval_batch in tqdm(eval_loader, desc=f"Evaluating (Step {global_step})", leave=True, colour='green'):
-                    input_features = eval_batch["input_features"].to(device)
-                    input_ids = eval_batch["input_ids"].to(device)
-                    labels = eval_batch["labels"].long().to(device)
-
-                    batch = input_features.size(0)
-                    total_samples += batch
-
-                    input_features_encoded = model.encoder(input_features)
-                    decoder_output = model.decoder(input_ids, input_features_encoded)
-                    logits = decoder_output.view(-1, decoder_output.size(-1))
-                    loss = loss_fn(logits, labels.view(-1))
-                    eval_loss += loss.item()
-                    all_predictions.extend(
-                        torch.argmax(decoder_output, dim=-1).cpu().numpy().tolist()
-                    )
-                    all_labels.extend(labels.cpu().numpy().tolist())
-                    batch_count += 1
-
-            eval_time = time.time() - eval_start_time
-            loss_avg = eval_loss / batch_count if batch_count > 0 else 0
-            predictions = {
-                "predictions": np.array(all_predictions, dtype=object),
-                "label_ids": np.array(all_labels, dtype=object),
-            }
-            metrics = compute_metrics(pred=predictions, tokenizer=tokenizer)
-
-            writer.add_scalar("Loss/eval", loss_avg, global_step)
-            writer.add_scalar("WER", metrics["wer"], global_step)
-            writer.add_scalar("EvalSamples", total_samples, global_step)
-            writer.add_scalar("EvalTimeSeconds", eval_time, global_step)
-            lr = scheduler.get_last_lr()[0]
-
-            print(
-                f"• STEP:{global_step} • samp:{samples_per_sec:.1f} • WER:{metrics['wer']:.2f}% • Loss:{loss_avg:.4f} • LR:{lr:.8f}"
-            )
-
-            logging.info(
-                f"EVALUATION STEP {global_step} - WER: {metrics['wer']:.2f}%, Loss: {loss_avg:.4f}, LR: {lr:.8f}"
-            )
-            # scheduler.step()
-            model.train()
-
-        if global_step % save_interval == 0:
-            checkpoint_path = os.path.join(
-                checkpoint_dir, f"checkpoint_step_{global_step}.pt"
-            )
-            torch.save(model.state_dict(), checkpoint_path)
-            # print(f"Model saved at step {global_step} to {checkpoint_path}")
-            logging.info(f"Model saved at step {global_step} to {checkpoint_path}")
-
-        lr = scheduler.get_last_lr()[0]
-        scheduler.step()
-        global_step += 1
-        step_in_report += 1
-
-        avg_loss = total_loss / (global_step + 1)
-        postfix_dict = {
-            "loss": f"{avg_loss:.4f}",
-            "lr": f"{lr:.6f}",
-            "samp": f"{samples_per_sec:.1f}",
-        }
-        progress_bar.set_postfix(postfix_dict, refresh=True)
-        progress_bar.update(1)
-
-    final_model_path = os.path.join(checkpoint_dir, "final_model.pt")
-    torch.save(model.state_dict(), final_model_path)
-    print(
-        f"Training completed after {global_step} steps. Final model saved to {final_model_path}"
-    )
-    writer.close()
-    progress_bar.close()
-
-
-def train_and_evaluate(
-    model, tokenizer, train_loader, eval_loader, optimizer, scheduler, loss_fn,
-    max_steps=10000, device='cuda', accumulation_steps=1, clear_cache=True,
-    log_interval=10, eval_interval=100, save_interval=1000,
-    checkpoint_dir="checkpoint_dir", log_dir="log_dir"
-):
-    model.to(device)
-    global_step = 0
-    scaler = torch.GradScaler()
-    writer = SummaryWriter(log_dir=log_dir)
-    train_iterator = iter(train_loader)
-    total_loss = 0
-    step_in_report = 0
-    dataset_epochs = 0
-
-    progress_bar = tqdm(total=max_steps, desc="Training Progress", leave=True, colour='green')
-
-    model.train()
-    optimizer.zero_grad()
-
-    while global_step < max_steps:
-        try:
-            batch = next(train_iterator)
-        except StopIteration:
-            train_iterator = iter(train_loader)
-            batch = next(train_iterator)
-            dataset_epochs += 1
-            print(f"Starting dataset epoch {dataset_epochs}")
-
-            if step_in_report > 0:
-                avg_loss = total_loss / step_in_report
-                logging.info(f"Dataset iteration complete - Steps: {global_step}, Avg Loss: {avg_loss:.4f}")
-                total_loss = 0
-                step_in_report = 0
-
-        start_time = time.time()
-
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-
-        with torch.autocast(device_type="cuda"):
-            output = model(**batch) if hasattr(model, '__call__') else model.forward(**batch)
-            logits = output["logits"] if isinstance(output, dict) and "logits" in output else output
-            labels = batch["labels"]
-            active_logits = logits.view(-1, logits.size(-1))
-            active_labels = labels.view(-1)
-            active_mask = active_labels != 0
-            active_logits = active_logits[active_mask]
-            active_labels = active_labels[active_mask]
-            loss = loss_fn(active_logits, active_labels)
-        total_loss += loss.item()
-        loss = loss / accumulation_steps
-
-        scaler.scale(loss).backward()
-
-        if (global_step + 1) % accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            if clear_cache:
-                torch.cuda.empty_cache()
-
-        end_time = time.time()
-        samples_per_sec = batch["spectrogram"].size(0) / (end_time - start_time)
-
-        if global_step % log_interval == 0:
-            writer.add_scalar(tag='Loss/train', scalar_value=total_loss / (global_step + 1), global_step=global_step)
-            lr = scheduler.get_last_lr()[0]
-            writer.add_scalar(tag='LearningRate', scalar_value=lr, global_step=global_step)
-            writer.add_scalar(tag='SamplesPerSec', scalar_value=samples_per_sec, global_step=global_step)
-
-        if global_step % eval_interval == 0:
-            model.eval()
-            eval_start_time = time.time()
-            eval_loss = 0
-            all_predictions = []
-            all_labels = []
-            batch_count = 0
-            total_samples = 0
-
-            with torch.no_grad():
-                for eval_batch in eval_loader:
-                    eval_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in eval_batch.items()}
-                    output = model(**eval_batch) if hasattr(model, '__call__') else model.forward(**eval_batch)
-                    logits = output["logits"] if isinstance(output, dict) and "logits" in output else output
-                    labels = eval_batch["labels"]
-                    batch_size = logits.size(0)
-                    total_samples += batch_size
-                    loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
-                    eval_loss += loss.item()
-                    all_predictions.extend(torch.argmax(logits, dim=-1).cpu().numpy().tolist())
-                    all_labels.extend(labels.cpu().numpy().tolist())
-                    batch_count += 1
-
-            eval_time = time.time() - eval_start_time
-            loss_avg = eval_loss / batch_count if batch_count > 0 else 0
-            predictions = {"predictions": np.array(all_predictions, dtype=object), "label_ids": np.array(all_labels, dtype=object)}
-            metrics = compute_metrics(pred=predictions, tokenizer=tokenizer)
-
-            writer.add_scalar('Loss/eval', loss_avg, global_step)
-            writer.add_scalar('WER', metrics['wer'], global_step)
-            writer.add_scalar('EvalSamples', total_samples, global_step)
-            writer.add_scalar('EvalTimeSeconds', eval_time, global_step)
-
-            lr = scheduler.get_last_lr()[0]
-            print(f"• STEP:{global_step} • samp:{samples_per_sec:.1f} • WER:{metrics['wer']:.2f}% • Loss:{loss_avg:.4f} • LR:{lr:.8f}")
-            logging.info(f"EVALUATION STEP {global_step} - WER: {metrics['wer']:.2f}%, Loss: {loss_avg:.4f}, LR: {lr:.8f}")
-            model.train()
-
-        if global_step % save_interval == 0:
-            checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_step_{global_step}.pt')
-            torch.save(model.state_dict(), checkpoint_path)
-            logging.info(f"Model saved at step {global_step} to {checkpoint_path}")
-
-        lr = scheduler.get_last_lr()[0]
-        scheduler.step()
-        global_step += 1
-        step_in_report += 1
-
-        avg_loss = total_loss / (global_step + 1)
-        postfix_dict = {
-            'loss': f'{avg_loss:.4f}',
-            'lr': f'{lr:.6f}',
-            'samp': f'{samples_per_sec:.1f}'
-        }
-        progress_bar.set_postfix(postfix_dict, refresh=True)
-        progress_bar.update(1)
-
-    final_model_path = os.path.join(checkpoint_dir, 'final_model.pt')
-    torch.save(model.state_dict(), final_model_path)
-    print(f"Training completed after {global_step} steps. Final model saved to {final_model_path}")
-    writer.close()
-    progress_bar.close()
-
-def get_optimizer(model, lr=5e-4, weight_decay=0.01):
-    return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, eps=1e-6, betas=(0.9, 0.98))
-
-def get_scheduler(optimizer, total_steps=10000):
-    return torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.25, total_iters=total_steps, last_epoch=-1)
-
-def get_loss_fn():
-    return torch.nn.CrossEntropyLoss(ignore_index=0)
-  
-class KVCache(nn.Module): # from i think nemo?
-    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
-        super().__init__()
-        cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
-        self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
-        self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
-
-    def update(self, input_pos, k_val, v_val):
-        # input_pos: [S], k_val: [B, H, S, D]
-        assert input_pos.shape[0] == k_val.shape[2]
-
-        k_out = self.k_cache
-        v_out = self.v_cache
-        k_out[:, :, input_pos] = k_val  # pyright: ignore[reportIndexIssue]
-        v_out[:, :, input_pos] = v_val # pyright: ignore[reportIndexIssue]
-
-        return k_out, v_out
-
-
-# class attentiona(nn.Module):
-#     def __init__(self, dims: int, head: int, max_iter: int = 3, threshold: float = 0.01, factor: float = 0.1, dropout: float = 0.1, temp = 1.0):
-#         super(attentiona, self).__init__()
-#         self.q,  self.k,  self.v,  self.o, self.lna, self.lnb = qkv_init(dims, head)
-#         self.dims = dims
-#         self.head = head
-#         self.head_dim = dims // head
-#         self.max_iter = max_iter
-#         self.threshold = nn.Parameter(torch.tensor(threshold))
-#         self.temp = nn.Parameter(torch.tensor(temp), requires_grad=True)        
-#         self.factor = nn.Parameter(torch.tensor(factor))
-#         self.lnc = nn.LayerNorm(self.head_dim, bias=False)
-#         self.lnd = nn.LayerNorm(self.head_dim, bias=False)     
-#         self.attn_local = LocalOut(self.head_dim)   
-
-#     def _focus(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None):
-#         z = default(xa, x)
-#         q, k, v = create_qkv(self.dims, self.head, self.q, self.k, self.v, self.lna(x), self.lna(z))    
-
-#         iteration = 0
-#         temp = self.temp.item()
-#         prev_out = torch.zeros_like(q)
-#         attn_out = torch.zeros_like(q)
-#         threshold = self.threshold.item()
-#         factor = self.factor.item()
-#         qcur = q
-
-#         while iteration < self.max_iter:
-#             eff_span = min(qcur.shape[1], k.shape[1])
-#             if xa is not None:
-#                 eff_span = min(eff_span, xa.shape[1])
-#             if eff_span == 0: 
-#                 break
-
-#             qiter = qcur[:, :, :eff_span, :]
-#             kiter = k[:, :, :eff_span, :]
-#             viter = v[:, :, :eff_span, :]
-#             q = self.attn_local.query_module(qiter)
-#             k = self.attn_local.key_module(kiter)
-#             v = self.attn_local.value_module(viter)
-
-#             iter_mask = None
-#             if mask is not None:
-#                 if mask.dim() == 4: 
-#                     iter_mask = mask[:, :, :eff_span, :eff_span]
-#                 elif mask.dim() == 2: 
-#                     iter_mask = mask[:eff_span, :eff_span]
-
-#             attn_iter = calculate_attention(
-#                 self.lnc(q), self.lnd(k), v,
-#                 mask=iter_mask, temp=temp)
-
-#             iter_out = torch.zeros_like(qcur)
-#             iter_out[:, :, :eff_span, :] = attn_iter
-#             diff = torch.abs(iter_out - prev_out).mean()
-#             dthresh = threshold + factor * diff
-#             if diff < dthresh and iteration > 0:
-#                 attn_out = iter_out
-#                 break
-
-#             prev_out = iter_out.clone()
-#             qcur = qcur + iter_out
-#             attn_out = iter_out
-#             iteration += 1
-#             temp += 0.005
-
-#         output = attn_out.permute(0, 2, 1, 3).flatten(start_dim=2)
-#         return self.o(output), None
-
-    # def _slide_win_local(self, x: Tensor, win_size: int, span_len: int, mask: Optional[Tensor] = None) -> Tensor:
-
-    #     batch, ctx, dims = x.shape
-    #     output = torch.zeros_like(x)
-    #     num_win = (ctx + win_size - 1) // win_size
-
-    #     for i in range(num_win):
-    #         qstart = i * win_size
-    #         qend = min(qstart + win_size, ctx)
-    #         win_qlen = qend - qstart
-    #         if win_qlen == 0: 
-    #             continue
-
-    #         kstart = max(0, qend - span_len)
-    #         kend = qend
-    #         qwin = x[:, qstart:qend, :]
-    #         kwin = x[:, kstart:kend, :]
-
-    #         win_mask = None
-    #         if mask is not None:
-    #             if mask.dim() == 4:
-    #                 win_mask = mask[:, :, qstart:qend, kstart:kend]
-    #             elif mask.dim() == 2:
-    #                 win_mask = mask[qstart:qend, kstart:kend]
-
-    #         attn_out, _ = self._focus(x=qwin, xa=kwin, mask=win_mask)
-    #         output[:, qstart:qend, :] = attn_out
-    #     return output
-
-    # def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None, 
-    #             use_sliding_win: bool = False, win_size: int = 512, span_len: int = 1024) -> Tensor:
-    #     if use_sliding_win:
-    #         return self._slide_win_local(x, win_size, span_len, mask)
-    #     else:
-    #         output, _ = self._focus(x, xa, mask)
-    #         return output
-   
+```
