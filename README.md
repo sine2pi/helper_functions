@@ -1,4 +1,4 @@
-Various things used in my models.
+
 
 ``` python
 import torch
@@ -27,6 +27,22 @@ from functools import partial, reduce
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 
+def causal_mask(i, j, device):
+    return torch.ones((i, j), device = device, dtype = torch.bool).triu(j - i + 1)
+
+def log(t, eps = 1e-20):
+    return torch.log(t + eps)
+
+def l2norm(t):
+    return F.normalize(t, dim = -1)
+
+def gumbel_noise(t):
+    noise = torch.zeros_like(t).uniform_(0, 1)
+    return -log(-log(noise))
+
+def gumbel_sample(t, temperature = 1., dim = -1):
+    return ((t / temperature) + gumbel_noise(t)).argmax(dim = dim)
+
 def valid(default_value, *items):
     for item in items:
         if item is not None:
@@ -39,6 +55,9 @@ def dict_to(d, device, dtype=dtype):
 
 def have(a):
     return a is not None
+    
+def Sequential(*modules):
+    return nn.Sequential(*filter(have, modules))    
 
 def AorB(a, b):
     return a if have(a) else b
@@ -63,7 +82,7 @@ def safe_div(n, d, eps = 1e-6):
 def lcm(*numbers):
     return int(reduce(lambda x, y: int((x * y) / gcd(x, y)), numbers, 1))
 
-class LayerNorm(nn.Module):
+class LayerNorma(nn.Module):
     def __init__(self, emb_dim):
         super().__init__()
         self.eps = 1e-5
@@ -75,6 +94,24 @@ class LayerNorm(nn.Module):
         var = x.var(dim=-1, keepdim=True, unbiased=False)
         norm_x = (x - mean) / torch.sqrt(var + self.eps)
         return self.scale * norm_x + self.shift
+
+class LayerNormb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.register_buffer("beta", torch.zeros(dim))
+
+    def forward(self, x):
+        return F.layer_norm(x, x.shape[-1:], self.gamma, self.beta)
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.scale = dim ** 0.5
+        self.gamma = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return self.gamma * F.normalize(x, dim = -1) * self.scale
 
 def get_device():
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -89,9 +126,49 @@ def cos_xy(x: Tensor, y: Tensor) -> Tensor:
     out = F.softmax(torch.matmul(F.normalize(x, dim=-1), F.normalize(y, dim=-1).transpose(0, 1)) / math.sqrt(x.shape[-1]), dim=-1)
     return out
 
-def cos_qkv(q: Tensor, k: Tensor, v: Tensor, mask) -> Tensor:
-    out = torch.matmul(F.softmax(torch.matmul(torch.nn.functional.normalize(q, dim=-1), torch.nn.functional.normalize(k, dim=-1).transpose(-1, -2)) + mask, dim=-1), v)
+def cos_qkv(q: Tensor, k: Tensor, v: Tensor, mask=None) -> Tensor:
+    out = torch.matmul(F.softmax(torch.matmul(torch.nn.functional.normalize(q, dim=-1), torch.nn.functional.normalize(k, dim=-1).transpose(-1, -2)) + (mask if mask is not None else 0), dim=-1), v)
     return out
+
+def cos_qkv_scaled(q: Tensor, k: Tensor, v: Tensor, mask=None) -> Tensor:
+    dk = q.size(-1)
+    attn_scores = torch.matmul(F.normalize(q, dim=-1), F.normalize(k, dim=-1).transpose(-1, -2))
+    scaled_attn_scores = attn_scores / math.sqrt(dk)
+    if mask is not None:
+        scaled_attn_scores = scaled_attn_scores + mask 
+    attention_weights = F.softmax(scaled_attn_scores, dim=-1)
+    out = torch.matmul(attention_weights, v)
+    return out
+
+class RelativePositionBias(nn.Module):
+    def __init__(self, dims, head, layer = 3):
+        super().__init__()
+        self.net = nn.ModuleList([])
+        self.net.append(nn.Sequential(nn.Linear(1, dims), nn.SiLU()))
+
+        for _ in range(layer - 1):
+            self.net.append(nn.Sequential(nn.Linear(dims, dims), nn.SiLU()))
+        self.net.append(nn.Linear(dims, head))
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def forward(self, i, j):
+        assert j >= i
+        device = self.device
+
+        i_pos = torch.arange(i, device = device) + (j - i)
+        j_pos = torch.arange(j, device = device)
+        rel_pos = (rearrange(i_pos, 'i -> i 1') - rearrange(j_pos, 'j -> 1 j'))
+        rel_pos += (j - 1)
+        x = torch.arange(-j + 1, j, device = device).float()
+        x = rearrange(x, '... -> ... 1')
+
+        for layer in self.net:
+            x = layer(x)
+        x = x[rel_pos]
+        return rearrange(x, 'i j h -> h i j')
 
 def sinusoids(ctx, dims, theta=10000):
     tscales = torch.exp(-torch.log(torch.tensor(float(theta))) / (dims // 2 - 1) * torch.arange(dims // 2, device=device, dtype=torch.float32))
@@ -99,25 +176,51 @@ def sinusoids(ctx, dims, theta=10000):
     positional_embedding = nn.Parameter(torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=1) , requires_grad=True)
     return positional_embedding
 
-class AbsolutePositionalEmbedding(nn.Module):
-    def __init__(self, dims, ctx):
+class AbsolutePositions(nn.Module):
+    def __init__(self, ctx, dims):
         super().__init__()
         self.emb = nn.Embedding(ctx, dims)
     def forward(self, x):
         return self.emb(torch.arange(x.shape[1], device=device))[None, :, :]
 
-class FixedPositionalEmbedding(nn.Module):
+class FixedPositions(nn.Module):
     def __init__(self, dims, head, ctx, theta=10000):
         super().__init__()
+
         freq = (theta / 220.0) * 700 * (
             torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 8000/700)), 
-                    (dims // head) // 2, device=theta.device, dtype=theta.dtype) / 2595) - 1) / 1000
-        position = torch.arange(0, ctx, dtype=torch.float)
+                    (dims // head) // 2, device=device, dtype=dtype) / 2595) - 1) / 1000
+
+        position = torch.arange(0, ctx, device=device, dtype=dtype)
         sinusoid_inp = torch.einsum("i,j->ij", position, freq)
         emb = torch.cat((sinusoid_inp.sin(), sinusoid_inp.cos()), dim=-1)
         self.register_buffer('emb', emb)
+
     def forward(self, x):
         return self.emb[None, :x.shape[1], :].to(x)
+
+class PositionalR(nn.Module):
+    def __init__(self, dims: int, ctx: int):
+        super().__init__()
+        self.dims = dims
+        self.ctx = ctx
+        self.pe = self.get_positional_encoding(ctx)
+
+    def get_positional_encoding(self, ctx):
+        pe = torch.zeros(ctx, self.dims)
+        position = torch.arange(0, ctx, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.dims, 2, dtype=torch.float32) * (-math.log(10000.0) / self.dims))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        return pe.to(device)
+
+    def forward(self, x):
+        ctx = x.size(1)
+        pe = self.pe[:, :ctx, :]
+        x = x * math.sqrt(self.dims)
+        x = x + pe
+        return x
 
 def pitch_bias(f0):
     f0_flat = f0.squeeze().float()
@@ -140,6 +243,36 @@ def apply_radii(freqs, x, ctx):
     idx = (idx * F).long().clamp(0, x.shape[0] - 1)
     x = x[idx]
     return torch.polar(x.unsqueeze(-1), freqs)
+
+class frequencies(nn.Module):
+    def __init__(self, dims, head, theta = 10000):
+        super().__init__()
+        dim = dims // head
+        inv_freq = theta ** -(torch.arange(0, dim, 2).float() / dim)
+        self.register_buffer('inv_freq', inv_freq)
+
+    def forward(self, x):
+        if isinstance(x, int):
+            ctx = x 
+        elif isinstance(x, torch.Tensor):    
+            if x.dim()   == 1:
+                ctx = x.shape            
+            elif x.dim() == 2:
+                batch, ctx = x.shape
+            elif x.dim() == 3:
+                batch, ctx, dims = x.shape
+            else:
+                batch, head, ctx, dims = x.shape
+        t = torch.arange(ctx, device=device).type_as(self.inv_freq)
+        freqs = torch.einsum('i , j -> i j', t, self.inv_freq)
+        return torch.cat((freqs, freqs), dim = -1)
+
+def rrotate_half(x):
+    x1, x2 = x.chunk(2, dim = -1)
+    return torch.cat((-x2, x1), dim = -1)
+
+def sapply_rotary_pos_emb(pos, t):
+    return t * pos.cos() + rrotate_half(t) * pos.sin()
 
 class axial_freqs(nn.Module):
     def __init__(self, dims, head, ctx, theta=10000, spec_shape=[]):
@@ -165,6 +298,10 @@ class axial_freqs(nn.Module):
         freqs_cis_y = torch.polar(torch.ones_like(freqs_y), freqs_y)
         return torch.cat([freqs_cis_x, freqs_cis_y], dim=-1)
 
+def compute_freqs_base(dim):
+    mel_scale = torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 4000/200)), dim // 2, device=device, dtype=dtype) / 2595) - 1
+    return 200 * mel_scale / 1000 
+
 class GELU(nn.Module):
     def __init__(self):
         super().__init__()
@@ -186,7 +323,7 @@ def trace_x(func):
         return result
     return wrapper
 
-def track_x(new_x, operation=""):  # track_x(x, "x") 
+def track_x(new_x, operation=""):
     x_id = [id(new_x)]
     if new_x is None:
         return new_x
@@ -198,7 +335,7 @@ def track_x(new_x, operation=""):  # track_x(x, "x")
         print(f"x REUSE: {cur_id} in {operation}")
     return new_x
 
-def track_xa(new_xa, operation=""): # track_xa(xa, "xa - decoder")
+def track_xa(new_xa, operation=""):
     xa_id = [id(new_xa)] if new_xa is not None else [None]
     if new_xa is None:
         return new_xa
@@ -228,6 +365,70 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
+def rotate_emb(x):
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+def apply_emb(q, k, cos, sin, ctx=None, unsqueeze_dim=1):
+    cos = cos[0].unsqueeze(unsqueeze_dim)
+    sin = sin[0].unsqueeze(unsqueeze_dim)
+    cos = cos[..., : cos.shape[-1] // 2].repeat_interleave(2, dim=-1)
+    sin = sin[..., : sin.shape[-1] // 2].repeat_interleave(2, dim=-1)
+    rotary_dim = cos.shape[-1]
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+    q_embed = (q_rot * cos) + (rotate_emb(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_emb(k_rot) * sin)
+    q_embed = torch.cat([q_embed, q_pass], dim=-1)
+    k_embed = torch.cat([k_embed, k_pass], dim=-1)
+    return q_embed, k_embed
+
+class RotaryEmb(nn.Module):
+    def __init__(n, dims, head):
+        super().__init__()
+        n.hd=dims // head
+ 
+        n.scaling = 1.0
+        n.theta = nn.Parameter((torch.tensor(360000, device=device, dtype=dtype)), requires_grad=False)  
+        n.register_buffer('freqs_base', n._compute_freqs_base(), persistent=False)
+        n.freqs = 1.0 / (n.theta ** (torch.arange(0, dims // head, 2, device=device, dtype=dtype)[:(dims // head // 2)].float() / dims // head))
+
+    def _compute_freqs_base(n):
+        mel_scale = torch.pow(10, torch.linspace(0, 2595 * torch.log10(torch.tensor(1 + 4000/200)), n.hd // 2, device=device, dtype=dtype) / 2595) - 1
+        return 200 * mel_scale / 1000 
+
+    def forward(n, x, ctx):
+        freqs = n.freqs[None, :, None].float().expand(ctx.shape[0], -1, 1).to(x.device)
+        position = ctx[:, None, :].float()
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cuda"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (freqs.float() @ position.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * n.scaling
+            sin = emb.sin() * n.scaling
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+class positions(nn.Module): 
+    def __init__(n, dims, head):
+        super().__init__()
+
+        n.audio = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)        
+        n.text = lambda length, dims, max_tscale: sinusoids(length, dims, max_tscale)  
+        n.rotary = RotaryEmb(dims, head)
+
+    def forward(n, x: Tensor, xa = None, kv_cache=None, fa=36000.0, fb=36000.0, freqs=False):
+        x = x + n.text(x.shape[1], x.shape[-1], fa).to(device, dtype)   
+        xa = xa + n.audio(xa.shape[1], xa.shape[-1], fb).to(device, dtype)    
+        if freqs:
+            ctx = torch.arange(0, x.shape[1], device=x.device).unsqueeze(0)
+            xf  = n.rotary(x, ctx)      
+            ctx = torch.arange(0, xa.shape[1], device=xa.device).unsqueeze(0)
+            xaf = n.rotary(xa, ctx)
+            return xf, xaf
+        else:
+            return x, xa
+
 class SLSTM(nn.Module):
     def __init__(self, dimension: int, num_layers: int = 2, skip: bool = False, bias = True, batch_first = True):
         super().__init__()
@@ -241,6 +442,7 @@ class SLSTM(nn.Module):
             y = y + x
         y = y.permute(1, 2, 0)
         return y
+
 @staticmethod
 def apply_rotary(x, freqs):
     x1 = x[..., :freqs.shape[-1]*2]
@@ -340,6 +542,7 @@ def taylor_cosine(x, order=5):
             else:
                 result += term
     return result
+
 def vectorized_taylor_sine(x, order=5):
     og_shape = x.shape
     x = x.flatten(0, -2)
@@ -369,50 +572,67 @@ def taylor_softmax(x, order=2):
         tapprox += x**i / factorial_i
     return tapprox / torch.sum(tapprox, dim=-1, keepdim=True)
 
-def hz_to_midi(hz): # Converts Hz to MIDI note number. Handles 0 Hz as unvoiced.
+def second_taylor(x: Tensor,  remove_even_power_dups = False):
+    dtype, device, dim = x.dtype, x.device, x.shape[-1]
+    x, ps = pack([x], '* d')
+    lead_dims = x.shape[0]
+    x0 = x.new_ones((lead_dims,))
+    x1 = x
+    x2 = einsum('... i, ... j -> ... i j', x, x) * (0.5 ** 0.5)
+  
+    if remove_even_power_dups:
+        x2_diagonal = torch.diagonal(x2, dim1 = -2, dim2 = -1)
+        mask = torch.ones(x2.shape[-2:], dtype = torch.bool).triu(1)
+        x2_upper_triangle = x2[:, mask] * sqrt(2)
+        x2 = torch.cat((x2_diagonal, x2_upper_triangle), dim = -1)
+    out, _ = pack((x0, x1, x2), 'b *')
+    out, = unpack(out, ps, '* d')
+    return out
+
+def hz_to_midi(hz):
     if hz == 0:
-        return 0  # Special value for unvoiced
+        return 0
     return 12 * np.log2(hz / 440) + 69
 
-def midi_to_pitch_class(midi_note): # Converts MIDI note number to pitch class (0-11).
+def midi_to_pitch_class(midi_note):
     if midi_note == 0:
-        return -1 # Represents unvoiced
+        return -1
     return int(round(midi_note)) % 12
 
-def pcp(pitch_hz, num_pitch_classes=12):  # Each frame is a vector representing the strength of each pitch class. 
+def pcp(pitch_hz, num_pitch_classes=12):
     pcp = torch.zeros(len(pitch_hz), num_pitch_classes)
     for i, hz in enumerate(pitch_hz):
         midi_note = hz_to_midi(hz)
         pitch_class = midi_to_pitch_class(midi_note)
-        if pitch_class != -1: # If it's a voiced frame
-            pcp[i, pitch_class] = 1 # Simple binary presence. Could be weighted by confidence.
+        if pitch_class != -1:
+            pcp[i, pitch_class] = 1
     return pcp
 
-def one_hot_pitch(pitch_hz, min_hz=50, max_hz=1000, num_bins=200): # Each bin represents a specific frequency range. 
+def one_hot_pitch(pitch_hz, min_hz=50, max_hz=1000, num_bins=200):
     pitch_bins = np.linspace(min_hz, max_hz, num_bins + 1)
     one_hot = torch.zeros(len(pitch_hz), num_bins)
     for i, hz in enumerate(pitch_hz):
         if hz > 0:
-            bin_idx = np.digitize(hz, pitch_bins) - 1  # Find the bin for the cur pitch
+            bin_idx = np.digitize(hz, pitch_bins) - 1
             if 0 <= bin_idx < num_bins:
                 one_hot[i, bin_idx] = 1
     return one_hot
 
-def gaussian_pitch(pitch_hz, min_hz=50, max_hz=1000, num_bins=200, sigma=1.0): # Pitch as a Gaussian distribution across frequency bins.
+def gaussian_pitch(pitch_hz, min_hz=50, max_hz=1000, num_bins=200, sigma=1.0):
     pitch_bins_hz = np.linspace(min_hz, max_hz, num_bins)
     gaussian = torch.zeros(len(pitch_hz), num_bins)
 
     for i, hz in enumerate(pitch_hz):
         if hz > 0:
-            midi_note = hz_to_midi(hz)                 # Calculate the bin index for the cur pitch
-            midi_min = hz_to_midi(min_hz)                 # Map MIDI notes to the bin scale
+            midi_note = hz_to_midi(hz)
+            midi_min = hz_to_midi(min_hz)
             midi_max = hz_to_midi(max_hz)
             bin_idx_float = (midi_note - midi_min) / (midi_max - midi_min) * (num_bins - 1)
 
-            for bin_j in range(num_bins):# Create a Gaussian distribution around the pitch
-                bin_center_midi = midi_min + (bin_j / (num_bins - 1)) * (midi_max - midi_min) # Calculate the center of the bin in MIDI
+            for bin_j in range(num_bins):
+                bin_center_midi = midi_min + (bin_j / (num_bins - 1)) * (midi_max - midi_min)
                 gaussian[i, bin_j] = torch.exp(-torch.tensor((midi_note - bin_center_midi)**2 / (2 * sigma**2)))
-            gaussian[i] /= gaussian[i].sum() # Normalize each row to sum to 1 (optional, depends on your needs)
+            gaussian[i] /= gaussian[i].sum()
             
     return gaussian
 
@@ -426,7 +646,6 @@ def crepe_predict(audio, sample_rate, viterbi=False):
     crepe_confidence = torch.from_numpy(confidence)
     crepe_activation = torch.from_numpy(activation)
     return crepe_time, crepe_frequency, crepe_confidence, crepe_activation
-
 
 def rbf_scores(q, k, rbf_sigma=1.0, rbf_ratio=0.0):
     dot_scores = torch.matmul(q, k.transpose(-1, -2))
@@ -595,11 +814,14 @@ class FEncoder(nn.Module):
            nn.Conv1d(mels, dims, kernel_size=3, stride=1, padding=1), act_fn,
            nn.Conv1d(dims, dims, kernel_size=3, stride=1, padding=1), act_fn,
            nn.Conv1d(dims, dims, kernel_size=3, stride=1, padding=1, groups=dims), act_fn)
+
+        self.norm = RMSNorm(dims)
         
     def forward(self, x):
         if x.dim() == 2:
             x = x.unsqueeze(0)        
-        x = self.encoder(x).permute(0, 2, 1)#.contiguous().to(device=device, dtype=dtype)
+        x = self.encoder(x).permute(0, 2, 1).contiguous().to(device=device, dtype=dtype)
+        x = self.norm(x)
         return x
 
 class WEncoder(nn.Module):
@@ -686,6 +908,7 @@ class PEncoder(nn.Module):
                 q, k, v = qkv(self.q, self.k, self.v, x=xa, xa=x, head=self.head)
                 out, _ = calculate_attention(q, k, v, mask=None, temperature=1.0, is_causal=True)
                 x = x + out
+
         return x
 
 class feature_encoder(nn.Module):
@@ -818,6 +1041,7 @@ class OneShot(nn.Module):
         q = self.q(x).view(B, L, self.head, self.head_dim).transpose(1,2)
         k = self.k(xa).view(B, K, self.head, self.head_dim).transpose(1,2)
         bias = (q @ k.transpose(-1, -2)) * self.scale / math.sqrt(self.head_dim)
+
         return bias
 
 class curiosity(nn.Module):
@@ -854,32 +1078,6 @@ class curiosity(nn.Module):
         g = torch.sigmoid(self.g).view(1, -1, 1, 1)
         out = self.merge(h_main * (1 - g) + h_aux * g)
         return self.o(out)
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, dims, ctx):
-        super(PositionalEncoding, self).__init__()
-        self.dims = dims
-        self.ctx = ctx
-        self.pe = self.get_positional_encoding(max_ctx=ctx)
-
-    def get_positional_encoding(self, max_ctx):
-        pe = torch.zeros(max_ctx, self.dims)
-        position = torch.arange(0, max_ctx, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, self.dims, 2, dtype=torch.float32)
-            * (-math.log(10000.0) / self.dims)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        return pe.to(device)
-
-    def forward(self, x):
-        ctx = x.size(1)
-        pe = self.pe[:, :ctx, :]
-        x = x * math.sqrt(self.dims)
-        x = x + pe
-        return x
 
 class Conv2d(nn.Conv2d):
     def _conv_forward(
@@ -918,7 +1116,6 @@ def LayerNorm(x: Tensor, normalized_shape: Union[int, Tensor, List, Tuple],
                weight: Optional[Tensor] = None, bias: Optional[Tensor] = None,
                eps: float = 1e-5) -> Tensor:
     return F.layer_norm(x, normalized_shape, weight, bias, eps)
-
 
 class SelfCriticalRL(nn.Module):
     def __init__(self, model, tokenizer, reward_fn):
@@ -1127,7 +1324,7 @@ def load_audio(file: str, sr: int = 16000):
         raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
     return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
 
-def pad_or_trim(array, length: int = 30, *, axis: int = -1):  # N_SAMPLES = CHUNK_LENGTH * SAMPLE_RATE  # 480000 samples in a 30-second chunk 
+def pad_or_trim(array, length: int = 30, *, axis: int = -1):
     if torch.is_tensor(array):
         if array.shape[axis] > length:
             array = array.index_select(
@@ -1187,8 +1384,7 @@ def mel_spectrogram(
 def audio_token(audio, labels, sample_rate=16000, hop_length=256, strides=1):
 
     frames_per_second = exact_div(sample_rate, hop_length)  
-    # key = F.softmax(torch.matmul(F.normalize(x, p=2, dim=-1), F.normalize(self.mkey, p=2, dim=-1).transpose(0, 1)) / math.sqrt(x.shape[-1]), dim=-1)
-    tokens_per_second = exact_div(sample_rate,  hop_length * strides) # audio "tokens"  20ms per audio token (exampe)
+    tokens_per_second = exact_div(sample_rate,  hop_length * strides)
     return tokens_per_second
 
 def harmonics_and_aperiodics(audio, f0, t, sample_rate):
@@ -1247,7 +1443,7 @@ def split_at_index(dim, index, t):
     r = (*pre_slices, slice(index, None))
     return t[l], t[r]
 
-def max_neg_value(tensor):
+def max_neg(tensor):
     return -torch.finfo(tensor.dtype).max
 
 def pitch_tokens(audio, labels, sample_rate=16000, hop_length=160, mode="mean", audio_bos=None):
@@ -1275,74 +1471,109 @@ def pitch_tokens(audio, labels, sample_rate=16000, hop_length=160, mode="mean", 
     tensor = torch.cat([torch.tensor([bos_token]), ptok])
     return torch.where(tensor == 0.0, torch.zeros_like(tensor), (tensor - 71.0) / (500.0 - 71.0))
 
+class DynamicLayerNorm(nn.Module):
+    def __init__(self, normalized_shape, summary_vector_dim):
+        super(DynamicLayerNorm, self).__init__()
+        self.normalized_shape = normalized_shape
+        self.gamma_generator = nn.Linear(summary_vector_dim, normalized_shape)
+        self.beta_generator = nn.Linear(summary_vector_dim, normalized_shape)
+
+    def forward(self, x, summary_vector):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        x_norm = (x - mean) / torch.sqrt(var + 1e-5)
+        gamma = self.gamma_generator(summary_vector)
+        beta = self.beta_generator(summary_vector)
+        return gamma * x_norm + beta
+
+class vDynamicLayerNorm(nn.Module):
+    def __init__(self, normalized_shape, summary_vector_dim):
+        super(vDynamicLayerNorm, self).__init__()
+        self.normalized_shape = normalized_shape
+        self.gamma_generator = nn.Linear(summary_vector_dim, normalized_shape)
+        self.beta_generator = nn.Linear(summary_vector_dim, normalized_shape)
+
+    def forward(self, x, summary_vector):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        x_norm = (x - mean) / torch.sqrt(var + 1e-5)
+        gamma = self.gamma_generator(summary_vector)
+        beta = self.beta_generator(summary_vector)
+        gamma = gamma.unsqueeze(1)
+        beta = beta.unsqueeze(1)
+        return gamma * x_norm + beta
+
+class SummaryVector(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, summary_vector_dim, output_dim):
+        super(SummaryVector, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.dln = vDynamicLayerNorm(hidden_dim, summary_vector_dim) 
+        self.fc = nn.Linear(hidden_dim, output_dim)
+        self.summary_lstm = nn.LSTM(input_dim, summary_vector_dim, 1, batch_first=True)
+
+    def forward(self, x):
+        _, (summary_vector, _) = self.summary_lstm(x)
+        summary_vector = summary_vector.squeeze(0)
+        lstm_output, _ = self.lstm(x) 
+        normalized_lstm_output = self.dln(lstm_output, summary_vector)
+        output = self.fc(normalized_lstm_output)
+        return output
+
+class aSummaryVector(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, summary_vector_dim, output_dim):
+        super(SummaryVector, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+
+        self.dln = DynamicLayerNorm(hidden_dim, summary_vector_dim) 
+        self.fc = nn.Linear(hidden_dim, output_dim)
+        self.summary_extractor = nn.Linear(input_dim, summary_vector_dim)
+
+    def forward(self, x):
+        summary_vector = self.summary_extractor(x.mean(dim=1)) 
+        lstm_output, _ = self.lstm(x) 
+        normalized_lstm_output = self.dln(lstm_output, summary_vector)
+        output = self.fc(normalized_lstm_output)
+        return output
+
+class AttentionPooling(nn.Module):
+    def __init__(self, encoder_hidden_dim):
+        super(AttentionPooling, self).__init__()
+        self.attention_query_generator = nn.Linear(encoder_hidden_dim, encoder_hidden_dim)
+        self.attention_mechanism = nn.Linear(encoder_hidden_dim, 1)
+
+    def forward(self, encoder_outputs):
+        query = torch.mean(encoder_outputs, dim=1)
+        scores = self.attention_mechanism(torch.tanh(encoder_outputs + self.attention_query_generator(query).unsqueeze(1)))
+        attention_weights = F.softmax(scores, dim=1)
+        pooled_output = torch.sum(attention_weights * encoder_outputs, dim=1)
+        return pooled_output, attention_weights
+
+class SummaryVector_Attention(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, summary_vector_dim, output_dim):
+        super(SummaryVector_Attention, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.attention_pooling = AttentionPooling(hidden_dim)
+        self.dln = DynamicLayerNorm(hidden_dim, summary_vector_dim) 
+        self.fc = nn.Linear(hidden_dim, output_dim)
+        self.summary_extractor = nn.LSTM(input_dim, summary_vector_dim, 1, batch_first=True) 
+
+    def forward(self, x):
+        _, (summary_vector, _) = self.summary_lstm(x)
+        summary_vector = summary_vector.squeeze(0)
+        lstm_output, _ = self.lstm(x) 
+        context_vector, attention_weights = self.attention_pooling(lstm_output)
+        lstm_output, _ = self.lstm(x) 
+        summary_vector_from_attention, attention_weights_viz = self.attention_pooling(lstm_output)        
+        normalized_lstm_output = self.dln(lstm_output, summary_vector_from_attention)
+        output = self.fc(normalized_lstm_output.mean(dim=1))
+        return output
+
 def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=False, pitch=False, harmonics=False, sample_rate=16000, hop_length=256, mode="mean", debug=False, phase_mod=False, crepe=False, aperiodics=False, dummy=False, mels=128, n_fft= 1024):
 
     sample_rate = batch["audio"]["sampling_rate"]
     labels = tokenizer.encode(batch["transcription"])
     audio = load_wave(batch["audio"], sample_rate)
-    # tokens = tokenize_feature(audio, labels)
         
-    # pitch_tensor_hz = torchaudio.functional.detect_pitch_frequency(waveform, sample_rate)
-    # if pitch_tensor_hz.dim() > 1 and pitch_tensor_hz.shape[0] == 1:
-    #     pitch_tensor_hz = pitch_tensor_hz.squeeze(0) 
-    # ctx = pitch_tensor_hz.shape[0]
-    # print(f"Original pitch tensor shape from torchaudio: {pitch_tensor_hz.shape}")
-    # pitch_hz_np = pitch_tensor_hz.numpy()
-    # num_pitch_classes = 128
-    # pcp_data = pcp(pitch_hz_np, num_pitch_classes=num_pitch_classes)
-    # pcp_data = pcp_data.unsqueeze(0).transpose(1, 2) # (1, num_pitch_classes, ctx)
-    # print(f"PCP data shape: {pcp_data.shape}")
-
-    # embedding_dim = 512
-    #nn.Conv1d_pcp = nn.Conv1d(in_channels=num_pitch_classes, out_channels=embedding_dim, kernel_size=3, stride=1, padding=1)
-    # output_pcp =nn.Conv1d_pcp(pcp_data)
-    # print(f"Conv1D output shape for PCP: {output_pcp.shape}")
-
-    # =========================================================================
-    # 2. One-Hot Encoding or Gaussian Distribution
-    # =========================================================================
-    # min_hz, max_hz, num_pitch_bins = 50, 1000, 200 # Example parameters
-    # one_hot_data = one_hot_pitch(pitch_hz_np, min_hz=min_hz, max_hz=max_hz, num_bins=num_pitch_bins)
-    # one_hot_data = one_hot_data.unsqueeze(0).transpose(1, 2) # (1, num_pitch_bins, ctx)
-    # print(f"One-Hot pitch data shape: {one_hot_data.shape}")
-
-    #nn.Conv1d_one_hot = nn.Conv1d(in_channels=num_pitch_bins, out_channels=embedding_dim, kernel_size=3, stride=1, padding=1)
-    # output_one_hot =nn.Conv1d_one_hot(one_hot_data)
-    # print(f"Conv1D output shape for One-Hot pitch: {output_one_hot.shape}")
-
-    # gaussian_data = gaussian_pitch(pitch_hz_np, min_hz=min_hz, max_hz=max_hz, num_bins=num_pitch_bins, sigma=0.5)
-    # gaussian_data = gaussian_data.unsqueeze(0).transpose(1, 2) # (1, num_pitch_bins, ctx)
-    # print(f"Gaussian pitch data shape: {gaussian_data.shape}")
-
-    #nn.Conv1d_gaussian = nn.Conv1d(in_channels=num_pitch_bins, out_channels=embedding_dim, kernel_size=3, stride=1, padding=1)
-    # output_gaussian =nn.Conv1d_gaussian(gaussian_data)
-    # print(f"Conv1D output shape for Gaussian pitch: {output_gaussian.shape}")
-
-    # =========================================================================
-    # 3. Learned Feature Extraction (nn.Embedding)
-    # =========================================================================
-
-    # min_midi = 21 # A0
-    # max_midi = 108 # C8
-    # num_pitch_categories = max_midi - min_midi + 1 + 1 # +1 for unvoiced at index 0
-
-    # quantized_pitch_sequence = torch.zeros(ctx, dtype=torch.long)
-    # for i, hz in enumerate(pitch_hz_np):
-    #     if hz > 0:
-    #         midi_note = hz_to_midi(hz)
-    #         quantized_midi = int(round(np.clip(midi_note, min_midi, max_midi)))
-    #         quantized_pitch_sequence[i] = quantized_midi - min_midi + 1
-
-    # embedding_layer = nn.Embedding(num_embeddings=num_pitch_categories, embedding_dim=embedding_dim)
-    # embedded_pitch = embedding_layer(quantized_pitch_sequence)
-    # embedded_pitch = embedded_pitch.unsqueeze(0).transpose(1, 2) # (1, embedding_dim, ctx)
-    # print(f"Embedded pitch data shape: {embedded_pitch.shape}")
-
-    #nn.Conv1d_embedding = nn.Conv1d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=3, stride=1, padding=1)
-    # output_embedding =nn.Conv1d_embedding(embedded_pitch)
-    # print(f"Conv1D output shape for embedded pitch: {output_embedding.shape}")
- 
-
     if crepe:
         crepe_time, crepe_frequency, crepe_confidence, crepe_activation = crepe_predict(audio, sample_rate, viterbi=True)
 
@@ -1352,138 +1583,35 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
         crepe_confidence = None
         crepe_activation = None
 
-        # spectrogram_config = {
-        #     "hop_length": 256,
-        #     "f_min": 150,
-        #     "f_max": 2000,
-        #     "n_mels": 128,
-        #     "n_fft": 1024,
-        #     "sample_rate": 16000,
-        #     "pad_mode": "constant",
-        #     "center": True, 
-        #     "power": 1.0,
-        #     "window_fn": torch.hann_window,
-        #     "mel_scale": "htk",
-        #     "norm": None,
-        #     "normalized": False,
-        # }
+    def mel_spectrogram(audio, sample_rate):
 
-        # spectrogram_config = {
-        #     "hop_length": 1280,  # Increased significantly for very low temporal resolution
-        #     "f_min": 500,        # Narrower range, especially eliminating some lower frequencies
-        #     "f_max": 1500,       # Narrower range, limiting higher frequencies
-        #     "n_mels": 8,         # Significantly reduced for very low frequency resolution
-        #     "n_fft": 128,        # Reduced for lower frequency resolution (related to hop_length and sample_rate)
-        #     "sample_rate": 8000, # Also reduced to lower the effective frequency range
-        #     "pad_mode": "constant",
-        #     "center": True,
-        #     "power": 1.0,
-        #     "window_fn": torch.hann_window,
-        #     "mel_scale": "htk",
-        #     "norm": None,
-        #     "normalized": False,
-        # }
-
-        # spectrogram_config = {
-        #     "hop_length": 320,
-        #     "f_min": 150,
-        #     "f_max": 2000,
-        #     "n_mels": 64,
-        #     "n_fft": 512,
-        #     "sample_rate": 16000,
-        #     "pad_mode": "constant",
-        #     "center": True,
-        #     "power": 1.0,
-        #     "window_fn": torch.hann_window,
-        #     "mel_scale": "htk",
-        #     "norm": None,
-        #     "normalized": False,
-        # }
-
-        # # Option 1: Reduce temporal resolution (increase hop_length)
-        # spectrogram_config_v1 = {
-        #     "hop_length": 480,  # Increased hop_length
-        #     "f_min": 150,
-        #     "f_max": 2000,
-        #     "n_mels": 128,
-        #     "n_fft": 1024,
-        #     "sample_rate": 16000,
-        #     "pad_mode": "constant",
-        #     "center": True,
-        #     "power": 1.0,
-        #     "window_fn": torch.hann_window,
-        #     "mel_scale": "htk",
-        #     "norm": None,
-        #     "normalized": False,
-        # }
-
-        # # Option 2: Reduce frequency resolution (decrease n_mels)
-        # spectrogram_config_v2 = {
-        #     "hop_length": 256,
-        #     "f_min": 150,
-        #     "f_max": 2000,
-        #     "n_mels": 64,  # Decreased n_mels
-        #     "n_fft": 1024,
-        #     "sample_rate": 16000,
-        #     "pad_mode": "constant",
-        #     "center": True,
-        #     "power": 1.0,
-        #     "window_fn": torch.hann_window,
-        #     "mel_scale": "htk",
-        #     "norm": None,
-        #     "normalized": False,
-        # }
-
-        # # Option 3: Reduce frequency resolution (decrease n_fft)
-        # spectrogram_config_v3 = {
-        #     "hop_length": 256,
-        #     "f_min": 150,
-        #     "f_max": 2000,
-        #     "n_mels": 128,
-        #     "n_fft": 512,  # Decreased n_fft
-        #     "sample_rate": 16000,
-        #     "pad_mode": "constant",
-        #     "center": True,
-        #     "power": 1.0,
-        #     "window_fn": torch.hann_window,
-        #     "mel_scale": "htk",
-        #     "norm": None,
-        #     "normalized": False,
-        # }
-
-        # # Option 4: Combined reduction (example)
-        # spectrogram_config = {
-        #     "hop_length": 320,
-        #     "f_min": 150,
-        #     "f_max": 2000,
-        #     "n_mels": 64,
-        #     "n_fft": 512,
-        #     "sample_rate": 16000,
-        #     "pad_mode": "constant",
-        #     "center": True,
-        #     "power": 1.0,
-        #     "window_fn": torch.hann_window,
-        #     "mel_scale": "htk",
-        #     "norm": None,
-        #     "normalized": False,
-        # }
-
-        # transform = torchaudio.transforms.MelSpectrogram(**spectrogram_config)
-        # mel_spectrogram = transform(audio)
-        # log_mel = torch.clamp(mel_spectrogram, min=1e-10).log10()
-        # log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
-        # spectrogram_tensor = (log_mel + 4.0) / 4.0
-        # return spectrogram_tensor
-
-        # transform = torchaudio.transforms.MelSpectrogram(**spectrogram_config)
-        # return transform(audio).log10()
+        spectrogram_config = {
+            "hop_length": 256,
+            "f_min": 150,
+            "f_max": 2000,
+            "n_mels": 128,
+            "n_fft": 1024,
+            "sample_rate": 16000,
+            "pad_mode": "constant",
+            "center": True, 
+            "power": 1.0,
+            "window_fn": torch.hann_window,
+            "mel_scale": "htk",
+            "norm": None,
+            "normalized": False,
+        }
+        transform = torchaudio.transforms.MelSpectrogram(**spectrogram_config)
+        mel_spectrogram = transform(audio)
+        log_mel = torch.clamp(mel_spectrogram, min=1e-10).log10()
+        log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
+        spectrogram_tensor = (log_mel + 4.0) / 4.0
+        return spectrogram_tensor
 
     if spec: 
-        # if dummy:
-        #     spectrogram_tensor = torch.ones(mels, 1024)
-        # else:
-        spectrogram_tensor = mel_spectrogram(audio=audio, n_mels=128, n_fft=400, hop_length=160, padding=0, device=device)
-            # spectrogram_tensor = FEncode(spectrogram_tensor)
+        if dummy:
+            spectrogram_tensor = torch.ones(mels, 1024)
+        else:
+            spectrogram_tensor = mel_spectrogram(audio, sample_rate)
     else:
         spectrogram_tensor = None
 
@@ -1530,19 +1658,10 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
         phase = None
 
     if pitch:
-        p_tensor = torchaudio.functional.detect_pitch_frequency(audio, sample_rate).unsqueeze(0)
-        # p_tensor = PEncode(p_tensor)
-
-        # pitch_tensor_hz = torchaudio.functional.detect_pitch_frequency(waveform, sample_rate)
-        # if pitch_tensor_hz.dim() > 1 and pitch_tensor_hz.shape[0] == 1:
-        #     pitch_tensor_hz = pitch_tensor_hz.squeeze(0) 
-        # ctx = pitch_tensor_hz.shape[0]
-        # # print(f"Original pitch tensor shape from torchaudio: {pitch_tensor_hz.shape}")
-        # pitch_hz_np = pitch_tensor_hz.numpy()
-        # num_pitch_classes = 128
-        # pcp_data = pcp(pitch_hz_np, num_pitch_classes=num_pitch_classes)
-        # p_tensor = pcp_data.unsqueeze(0).transpose(1, 2) # (1, num_pitch_classes, ctx)
-        # print(f"PCP data shape: {pcp_data.shape}")
+        if dummy:
+            p_tensor = torch.ones(1, 1024)
+        else:
+            p_tensor = torchaudio.functional.detect_pitch_frequency(audio, sample_rate).unsqueeze(0)
 
     else:
         p_tensor = None
@@ -1562,31 +1681,9 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
 
     if waveform:
         wave_tensor = audio
-        # wave_tensor = WEncode(wave_tensor)
     else:
         wave_tensor = None
 
-    if dummy:   
-        batch_size = 1
-        ctx = 1024
-        if spectrogram_tensor is not None:
-            # spectrogram_tensor = torch.randn(mels, ctx)
-            spectrogram_tensor = torch.ones(mels, ctx)
-        
-        if p_tensor is not None:
-            p_tensor = torch.ones_like(p_tensor) 
-      
-        if pitch_tokens_tensor is not None:
-            dummy_tensor = torch.ones_like(pitch_tokens_tensor)
-        
-        else:
-            batch_size = 128
-            ctx = 1024
-            dummy_tensor = torch.ones(batch_size, ctx)
-            dummy_tensor = dummy_tensor.to(device)
-    else:
-        dummy_tensor = None
-        
     if debug:
         print(f"['pitch_tokens']: {pitch_tokens_tensor.shape if pitch_tokens else None}")
         print(f"['harmonic']: {harmonic_tensor.shape if harmonics else None}")
@@ -1600,7 +1697,6 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
         print(f"['crepe_frequency']: {crepe_frequency.shape if crepe else None}")
         print(f"['crepe_confidence']: {crepe_confidence.shape if crepe else None}")
         print(f"['crepe_activation']: {crepe_activation.shape if crepe else None}")
-        # print(f"['dummy']: {dummy_tensor.shape if dummy else None}")
 
     return {
         "waveform": wave_tensor if waveform else None,
@@ -1615,11 +1711,11 @@ def extract_features(batch, tokenizer, waveform=False, spec=False, pitch_tokens=
         "crepe_frequency": crepe_frequency if crepe else None,
         "crepe_confidence": crepe_confidence if crepe else None,
         "crepe_activation": crepe_activation if crepe else None,
-        # "dummy": dummy_tensor if dummy else None,
     }
 
 def plot_waveform(waveform, sr, title="Waveform", ax=None):
     waveform = waveform.numpy()
+
     num_channels, num_frames = waveform.shape
     time_axis = torch.arange(0, num_frames) / sr
 
@@ -1822,14 +1918,13 @@ class StraightThroughThreshold(torch.autograd.Function):
 
 apply_ste_threshold = StraightThroughThreshold.apply
 
-def sinusoids(length, dims):
+def sinusoidz(length, dims):
     position = torch.arange(0, length, dtype=torch.float).unsqueeze(1)
     div_term = torch.exp(torch.arange(0, dims, 2).float() * (-math.log(10000.0) / dims))
     pe = torch.zeros(length, dims)
     pe[:, 0::2] = torch.sin(position * div_term)
     pe[:, 1::2] = torch.cos(position * div_term)
     return pe.unsqueeze(0)
-
 
 class t_gate(nn.Module):
     def __init__(self, dims: int, head: int, threshold: float = 0.8):
@@ -1929,56 +2024,57 @@ class OneShot(nn.Module):
         k = self.k(xa).view(B, K, self.head, self.hdim).transpose(1,2)
         return (q @ k.transpose(-1, -2)) * self.scale / math.sqrt(self.hdim) 
 
+class ContextualBiasingGate2(nn.Module):
+    def __init__(self, dims: int, head: int, memory_size: int, threshold: float = 0.8):
+        super().__init__()
+        self.dims = dims
+        self.head = head
+        self.memory_size = memory_size
+        self.threshold = threshold
+        self.mkeys = {}
+        self.xa_projection = nn.Linear(dims, dims)
+        self.tgate_activation = nn.Sigmoid()
+        self.head_bias_weights = nn.Parameter(torch.ones(head))
+        self.pattern = lambda length, dims, max_tscale: sinusoids(length, dims)  
+        self.embedding = nn.Embedding(self.pattern, dims)
+        self.one_shot = OneShot(dims, head)
 
-# class ContextualBiasingGate2(nn.Module):
-#     def __init__(self, dims: int, head: int, memory_size: int, threshold: float = 0.8):
-#         super(ContextualBiasingGate, self).__init__()
-#         self.dims = dims
-#         self.head = head
-#         self.memory_size = memory_size
-#         self.threshold = threshold
-#         self.mkeys = {}  # {pattern_embedding_tuple: bias_scalar_weight_tensor}
-#         self.xa_projection = nn.Linear(dims, dims)
-#         self.tgate_activation = nn.Sigmoid()
-#         self.head_bias_weights = nn.Parameter(torch.ones(head))
-#         self.pattern = lambda length, dims, max_tscale: sinusoids(length, dims)  
-#         self.embedding = nn.Embedding(self.pattern, dims)
-#         self.one_shot = OneShot(dims, head)
+        for _ in range(memory_size):
+            pattern = lambda length, dims, max_tscale: sinusoids(length, dims) 
+            bias_weight = OneShot(dims, head)
+            self.mkeys[tuple(pattern.tolist())] = bias_weight
 
-#         for _ in range(memory_size): # example
-#             pattern = lambda length, dims, max_tscale: sinusoids(length, dims) 
-#             bias_weight = OneShot(dims, head)
-#             self.mkeys[tuple(pattern.tolist())] = bias_weight
+    def forward(self, shot_bias: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        x = self.xa_projection(x.mean(dim=1))
+        last_x = []
+        previous_best = None 
 
-#     def forward(self, shot_bias: torch.Tensor, xa: torch.Tensor) -> torch.Tensor:
-#         if shot_bias is None:
-#             return None
+        for b in range(x.size(0)):
+            cur_x = x[b]
+            score = -1.0
+            current_best = None  
 
-#         xa = self.xa_projection(xa.mean(dim=1)) # (B, D)
-#         logits = []
+            for pattern, bias in self.mkeys.items():
+                pattern_tensor = torch.tensor(pattern).to(cur_x.device)
+                similarity = F.cosine_similarity(cur_x, pattern_tensor, dim=0)
 
-#         for b in range(xa.size(0)): # Iterate through the batch
-#             cur_xa = xa[b]
-#             score = -1.0
-#             best_weights = None
+                if similarity > score:
+                    score = similarity
+                    current_best = bias
 
-#             for pattern, bias_weights in self.mkeys.items():
-#                 pattern_tensor = torch.tensor(pattern).to(cur_xa.device)
-#                 similarity = F.cosine_similarity(cur_xa, pattern_tensor, dim=0)
+            gating_value = self.tgate_activation(score.unsqueeze(0))
+            current_shot_bias = shot_bias[b]
 
-#                 if similarity > score:
-#                     score = similarity
-#                     best_weights = bias_weights
-
-#             gating_value = self.tgate_activation(score.unsqueeze(0))
-#             shot_bias = shot_bias[b] # (head, Q, K)
-
-#             if gating_value > self.threshold and best_weights is not None:
-#                 scaled_bias = shot_bias * (best_weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)) # (H,Q,K) * (H,1,1,1)
-#                 logits.append(scaled_bias)
-#             else:
-#                 logits.append(shot_bias)
-#         return torch.stack(logits, dim=0) # (B, head, Q, K)
+            if gating_value > self.threshold and current_best is not None:
+                if previous_best is None or not torch.equal(current_best, previous_best):
+                    scaled_bias = current_shot_bias * (current_best.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1))
+                    last_x.append(scaled_bias)
+                else: 
+                    last_x.append(current_shot_bias)
+            else: 
+                last_.append(current_shot_bias)
+            previous_best = current_best 
+        return torch.stack(last_x, dim=0)
 
 class ContextualBias(nn.Module):
     def __init__(self, dims: int, head: int, memory_size: int, threshold: float = 0.8):
@@ -1999,7 +2095,7 @@ class ContextualBias(nn.Module):
         q = self.q(x).view(B, Q, self.head, self.hdim).transpose(1,2)
         k = self.k(x if xa is None else xa).view(B, K, self.head, self.hdim).transpose(1,2)
         v = self.v(x if xa is None else xa).view(B, K, self.head, self.hdim).transpose(1,2)
-        qk = (q @ k.transpose(-1, -2)) / math.sqrt(self.hdim) # (B, H, Q, K)
+        qk = (q @ k.transpose(-1, -2)) / math.sqrt(self.hdim)
         x = self.one_shot(x, xa)
         if x is not None:
             bias = self.biasing_gate(x, xa)
@@ -2019,19 +2115,19 @@ class BiasingGate(nn.Module):
         self.pattern = lambda length: sinusoids(length, dims=dims)  
         self.one_shot = OneShot(dims, head)
 
-    def forward(self, x, xa) -> torch.Tensor: # x is bias
+    def forward(self, x, xa) -> torch.Tensor:
         if x is None:
             return None
 
-        for _ in range(self.memory_size): # example
+        for _ in range(self.memory_size):
             self.mkeys["pattern"] = self.pattern(xa.shape[1]).to(device, dtype)
             bias_weights = x
             self.mkeys["bias"] = bias_weights
    
-        xa = self.xa_projection(xa.mean(dim=1)) # (B, D)
+        xa = self.xa_projection(xa.mean(dim=1))
         logits = []
 
-        for b in range(xa.size(0)): # Iterate through the batch
+        for b in range(xa.size(0)): 
             cur_xa = xa[b]
             score = -1.0
             best_weights = None
@@ -2046,14 +2142,14 @@ class BiasingGate(nn.Module):
 
             score = torch.tensor(score)
             gating_value = self.activation(score)
-            shot_bias = x[b] # (head, Q, K)
+            shot_bias = x[b]
 
             if gating_value > self.threshold and best_weights is not None:
-                scaled_bias = shot_bias * (best_weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)) # (H,Q,K) * (H,1,1,1)
+                scaled_bias = shot_bias * (best_weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1))
                 logits.append(scaled_bias)
             else:
                 logits.append(shot_bias)
-        return torch.stack(logits, dim=0) # (B, head, Q, K)
+        return torch.stack(logits, dim=0)
 
 class BiasingGateB(nn.Module):
     def __init__(self, dims: int, head: int, memory_size: int = 64, threshold: float = 0.8):
@@ -2069,7 +2165,7 @@ class BiasingGateB(nn.Module):
         self.pattern = lambda length, dims, max_tscale: sinusoids(length, dims)  
         self.one_shot = OneShot(dims, head)
 
-        for _ in range(memory_size): # example
+        for _ in range(memory_size):
             pattern = lambda length, dims, max_tscale: sinusoids(length, dims) 
             bias_weight = OneShot(dims, head)
             self.mkeys[tuple(pattern.tolist())] = bias_weight
@@ -2098,17 +2194,17 @@ class BiasingGateB(nn.Module):
 class CuriosityHead(nn.Module):
     def __init__(self, d, h, bias=True, memory_size=10, cb_threshold=0.7):
         super().__init__()
-        self.h  = h              # base heads
+        self.h  = h
         self.dh = d // h
         self.qkv = nn.Linear(d, d * 3, bias=bias)
-        self.qkv_aux = nn.Linear(d, d * 3, bias=bias)  # curiosity heads
+        self.qkv_aux = nn.Linear(d, d * 3, bias=bias)
         self.o  = nn.Linear(d, d, bias=bias)
-        self.g  = nn.Parameter(torch.zeros(h))         # per-head gate logit
+        self.g  = nn.Parameter(torch.zeros(h))
         self.contextual_biasing_gate = BiasingGateB(d, h, memory_size, cb_threshold)
 
     def split(self, x):
         b, t, _ = x.shape
-        return x.view(b, t, self.h, self.dh).transpose(1, 2)  # b h t dh
+        return x.view(b, t, self.h, self.dh).transpose(1, 2)
 
     def merge(self, x):
         b, h, t, dh = x.shape
@@ -2119,17 +2215,17 @@ class CuriosityHead(nn.Module):
         qa, ka, va = self.qkv_aux(xa).chunk(3, -1)
         q, k, v   = map(self.split, (q, k, v))
         qa, ka, va = map(self.split, (qa, ka, va))
-        dots      = (q @ k.transpose(-2, -1)) / self.dh**0.5      # b h t t
-        dots_aux  = (q @ ka.transpose(-2, -1)) / self.dh**0.5     # b h t ta
+        dots      = (q @ k.transpose(-2, -1)) / self.dh**0.5
+        dots_aux  = (q @ ka.transpose(-2, -1)) / self.dh**0.5
         if mask is not None: dots = dots.masked_fill(mask, -9e15)
         p   = dots.softmax(-1)
         pa  = dots_aux.softmax(-1)
 
-        h_main = p  @ v                       # b h t dh
-        h_aux  = pa @ va                      # b h t dh
-        contextual_gate_bias = self.contextual_biasing_gate(x) # (B, H)
-        g_biased_logits = self.g + contextual_gate_bias # (B, H)
-        g = torch.sigmoid(g_biased_logits).view(x.size(0), -1, 1, 1) # b h 1 1 broadcast
+        h_main = p  @ v
+        h_aux  = pa @ va
+        contextual_gate_bias = self.contextual_biasing_gate(x)
+        g_biased_logits = self.g + contextual_gate_bias
+        g = torch.sigmoid(g_biased_logits).view(x.size(0), -1, 1, 1)
         out = self.merge(h_main * (1 - g) + h_aux * g)
         return self.o(out)
 
@@ -2191,9 +2287,6 @@ class DataCollator:
                         pad_item = F.pad(item, (0, pad_width), mode='constant', value=pad_token_id)
                     else:
                         pad_item = item
-
-                    # if pad_item == "spectrogram":
-                    #     pad_item = FEncode(pad_item)
 
                     padded.append(pad_item)
                 batch[key] = torch.stack(padded)
@@ -2266,16 +2359,13 @@ def compute_metrics(pred, tokenizer=None, model=None, print_pred=False, num_samp
     if model is not None:
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000
         efficiency_score = (100 - wer) / trainable_params if trainable_params > 0 else 0.0
-        # jump_logs = model.processor.res.dsl.logs
     else:
         trainable_params = 0.0
         efficiency_score = 0.0
-        # jump_logs = None
 
     return {
         "wer": float(wer),
         "efficiency_score": float(efficiency_score),
-        # "jump_logs": jump_logs["jumps"][0],
     }
 
 def preprocess_logits_for_metrics(logits, labels):
@@ -2352,8 +2442,6 @@ class MyModel(nn.Module):
                 layer_dict['special_attention'] = attentiona(dims, head)
             self.layers.append(nn.ModuleDict(layer_dict))
         
-        # self.attention_auxiliary = attentiona(dims, head) 
-
     def forward(self, x, xa, enc=None, sequential=False, modal=False, blend=False, kv_cache=None) -> torch.Tensor:    
    
         if self.num_layers > 0:
@@ -2378,6 +2466,7 @@ class MyModel(nn.Module):
 
         if self.num_layers > 5:
             cur_dict = self.layers[5]
+
             x = cur_dict['res3'](a + b + c) 
             
             x = cur_dict['res3'](x, xa, None)
@@ -2397,40 +2486,6 @@ class MyModel(nn.Module):
             x = cur_dict['lna'](x)
 
         return x
-
-        # self.layers = nn.ModuleList()
-        # for _ in range(layer):
-        #     self.layers.append(nn.ModuleList({
-        #         'lna': nn.LayerNorm(dims),
-        #         'lnb': nn.LayerNorm(dims),
-        #         "res1": residual(dims, head, layer, act_fn),
-        #         "res2": residual(dims, head, layer, act_fn),
-        #         "res3": residual(dims, head, layer, act_fn),      
-                    
-        #         }))
-
-        # if self.layer > 0:
-        #     res = self.layers[0]
-        #     xa = res['res1'](xa) 
-
-        # if self.layer > 1:
-        #     res = self.layers[1]
-        #     a  = res['res2'](x, mask=mask)
-
-        # if self.layer > 4:
-        #     res = self.layers[4]
-        #     b = res['res3'](x, xa, None)
-
-        # # for i in range(3, self.layer):
-        # #     res = self.layers[i]
-        #     xm = res['res4'](torch.cat([x, xa], dim=1))
-        #     c  = res['res4'](xm[:, :x.shape], xm[:, x.shape:], mask=None)
-
-        # for i in range(4, self.layer):
-        #     res = self.layers[i]
-        #     x = res['res3'](a + b + c) 
-        #     x = res['res3'](x, xa, None)
-        #     x = res['lna'](x)
 
 class attention_a(nn.Module):
     def __init__(self, dims: int, head: int, layer):
@@ -2473,10 +2528,6 @@ class attentio0(nn.Module):
         self.lna = nn.LayerNorm(dims) 
         self.lnb = nn.LayerNorm(dims // head) 
 
-        # self.rotary_emb = RotaryEmbedding(dims // head)
-
-       # print(f"x, {x.shape}, xa, {xa.shape if xa is not None else None}, mask {mask.shape if mask is not None else None}")
-        # zero = self.zero
     def forward(self, x, xa = None, mask = None,  positions = None):
 
         q = self.q(x)
@@ -2545,12 +2596,10 @@ class attentio0b(nn.Module):
 
         qk = qk * zscale.unsqueeze(-2)
         qk = F.softmax(qk, dim=-1)
-        # qk = taylor_softmax(qk, order=2)
         wv = einsum('b h k q, b h q d -> b h k d', qk, v) 
         wv = rearrange(wv, 'b h c d -> b c (h d)')
         out = self.out(wv)
         return out
-
 
 class attention(nn.Module):
     def __init__(self, dims: int, head: int, layer):
@@ -2570,11 +2619,6 @@ class attention(nn.Module):
 
         self.lna = nn.LayerNorm(dims) 
         self.lnb = nn.LayerNorm(dims // head) 
-
-        # self.rotary_emb = RotaryEmbedding(dims // head)
-
-       # print(f"x, {x.shape}, xa, {xa.shape if xa is not None else None}, mask {mask.shape if mask is not None else None}")
-        # zero = self.zero
 
 def forward_revised(self, x, xa = None, mask = None):
     q = self.q(x)
@@ -2597,6 +2641,8 @@ def forward_revised(self, x, xa = None, mask = None):
     wv = rearrange(wv, 'b h c d -> b c (h d)')
     out = self.out(wv)
     return out
+
+
 
 
 ```
