@@ -21,6 +21,27 @@ from functools import partial, reduce, lru_cache
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 
+class PeriodicReLU(nn.Module):
+    def __init__(self, period=1.0, slope=1.0, bias=0.0):
+        super().__init__()
+
+        self.period = nn.Parameter(torch.tensor(period))
+        self.slope = nn.Parameter(torch.tensor(slope))
+        self.bias = nn.Parameter(torch.tensor(bias))
+
+    def forward(self, x):
+        scaled_x = x * (math.pi / self.period)
+        sawtooth = scaled_x - torch.floor(scaled_x)
+        triangle_wave = 2 * torch.abs(sawtooth - 0.5) - 1
+        return self.slope * triangle_wave + self.bias
+
+def snake(x, alpha):
+    shape = x.shape
+    x = x.reshape(shape[0], shape[1], -1)
+    x = x + (alpha + 1e-9).reciprocal() * torch.sin(alpha * x).pow(2)
+    x = x.reshape(shape)
+    return x
+
 def causal_mask(i, j, device):
     return torch.ones((i, j), device = device, dtype = torch.bool).triu(j - i + 1)
 
